@@ -1,0 +1,54 @@
+# Tier 0 Debug Config: SmolLM2-135M-Instruct
+# Fast 2-minute pipeline verification for Stage 1 -> Surgery -> Stage 2 FOMAML -> Eval
+
+model:
+  name_or_path: "HuggingFaceTB/SmolLM2-135M-Instruct"
+  num_experts: 4
+  rank: 4
+  alpha: 16.0
+  router_temp: 1.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
+  ttt_layer_indices: "upper_half"
+
+stage1:
+  lr_experts: 2.0e-4
+  lr_router: 5.0e-4
+  weight_decay: 0.01
+  total_steps: 200
+  warmup_steps: 20
+  batch_size: 4
+  max_length: 256
+  lambda_bal: 0.01
+  lambda_z: 1.0e-3
+  lambda_ortho: 0.05
+  temp_start: 1.5
+  temp_end: 0.7
+  logging_steps: 10
+  save_steps: 100
+  output_dir: "checkpoints/tier0/stage1"
+
+surgery:
+  freeze_static_experts: true
+  scratchpad_bias_init: -2.0
+  output_dir: "checkpoints/tier0/stage2_init"
+
+stage2:
+  inner_steps: 2
+  meta_lr_gate: 2.0e-4
+  meta_lr_scratchpad: 2.0e-4
+  meta_lr_eta: 1.0e-3
+  gamma_kl: 0.1
+  gamma_ortho: 0.05
+  lambda_kl: 0.1
+  meta_batch_size: 2
+  total_episodes: 50
+  max_length: 256
+  logging_episodes: 5
+  save_episodes: 25
+  output_dir: "checkpoints/tier0/stage2"
+
+inference:
+  inner_steps: 2
+  max_new_tokens: 64
+  temperature: 0.7
+  top_p: 0.9

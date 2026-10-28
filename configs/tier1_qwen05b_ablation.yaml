@@ -1,0 +1,54 @@
+# Tier 1 Dev / Ablation Config: Qwen2.5-0.5B-Instruct
+# Rapid hyperparameter sweeps (lambda_ortho, gamma_kl, k) and baseline comparisons
+
+model:
+  name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  num_experts: 6
+  rank: 8
+  alpha: 16.0
+  router_temp: 1.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
+  ttt_layer_indices: "upper_half"
+
+stage1:
+  lr_experts: 2.0e-4
+  lr_router: 5.0e-4
+  weight_decay: 0.01
+  total_steps: 1000
+  warmup_steps: 100
+  batch_size: 16
+  max_length: 512
+  lambda_bal: 0.01
+  lambda_z: 1.0e-3
+  lambda_ortho: 0.05
+  temp_start: 1.5
+  temp_end: 0.7
+  logging_steps: 20
+  save_steps: 250
+  output_dir: "checkpoints/tier1/stage1"
+
+surgery:
+  freeze_static_experts: true
+  scratchpad_bias_init: -2.0
+  output_dir: "checkpoints/tier1/stage2_init"
+
+stage2:
+  inner_steps: 3
+  meta_lr_gate: 2.0e-4
+  meta_lr_scratchpad: 2.0e-4
+  meta_lr_eta: 1.0e-3
+  gamma_kl: 0.1
+  gamma_ortho: 0.05
+  lambda_kl: 0.1
+  meta_batch_size: 4
+  total_episodes: 500
+  max_length: 512
+  logging_episodes: 10
+  save_episodes: 100
+  output_dir: "checkpoints/tier1/stage2"
+
+inference:
+  inner_steps: 3
+  max_new_tokens: 128
+  temperature: 0.7
+  top_p: 0.9

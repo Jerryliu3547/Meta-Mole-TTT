@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints & model weights
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# Logs & SLURM outputs
+logs/
+*.out
+*.err
+
+# Generated artifacts & figures
+artifacts/
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# OS / Editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
