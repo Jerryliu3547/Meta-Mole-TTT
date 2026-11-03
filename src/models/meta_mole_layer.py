@@ -61,23 +61,26 @@ class MetaMoLELinear(nn.Module):
         for p in self.base_layer.parameters():
             p.requires_grad = False
 
+        device = base_layer.weight.device
+        dtype = base_layer.weight.dtype
+
         # N Collaborative Static Experts: A_static [N, r, d_in], B_static [N, d_out, r]
-        self.A_static = nn.Parameter(torch.empty(num_experts, rank, self.in_features))
-        self.B_static = nn.Parameter(torch.empty(num_experts, self.out_features, rank))
+        self.A_static = nn.Parameter(torch.empty(num_experts, rank, self.in_features, device=device, dtype=dtype))
+        self.B_static = nn.Parameter(torch.empty(num_experts, self.out_features, rank, device=device, dtype=dtype))
         self.expert_norm = ParameterFreeRMSNorm()
 
         # Stage 1 Router: [N, d_in] and bias [N]
-        self.router_weight = nn.Parameter(torch.empty(num_experts, self.in_features))
-        self.router_bias = nn.Parameter(torch.zeros(num_experts))
+        self.router_weight = nn.Parameter(torch.empty(num_experts, self.in_features, device=device, dtype=dtype))
+        self.router_bias = nn.Parameter(torch.zeros(num_experts, device=device, dtype=dtype))
 
         # Stage 2 Dynamic Scratchpad & Meta-SGD Learning Rates (activated during surgery)
-        self.A_dyn = nn.Parameter(torch.empty(rank, self.in_features), requires_grad=False)
-        self.B_dyn = nn.Parameter(torch.zeros(self.out_features, rank), requires_grad=False)
+        self.A_dyn = nn.Parameter(torch.empty(rank, self.in_features, device=device, dtype=dtype), requires_grad=False)
+        self.B_dyn = nn.Parameter(torch.zeros(self.out_features, rank, device=device, dtype=dtype), requires_grad=False)
 
         # Meta-SGD inverse-softplus parameters (softplus(-4.6) ~= 0.01)
-        self.raw_eta_gate = nn.Parameter(torch.tensor(-4.6), requires_grad=False)
-        self.raw_eta_A_dyn = nn.Parameter(torch.tensor(-5.3), requires_grad=False)
-        self.raw_eta_B_dyn = nn.Parameter(torch.tensor(-4.6), requires_grad=False)
+        self.raw_eta_gate = nn.Parameter(torch.tensor(-4.6, device=device, dtype=dtype), requires_grad=False)
+        self.raw_eta_A_dyn = nn.Parameter(torch.tensor(-5.3, device=device, dtype=dtype), requires_grad=False)
+        self.raw_eta_B_dyn = nn.Parameter(torch.tensor(-4.6, device=device, dtype=dtype), requires_grad=False)
 
         # Holder for adapted parameters during inner-loop TTT steps
         self._adapted_params: Optional[Dict[str, torch.Tensor]] = None
@@ -86,16 +89,26 @@ class MetaMoLELinear(nn.Module):
 
     def _init_stage1_weights(self):
         """Initializes static experts and router with symmetry-breaking orthogonal init."""
-        flat_A = torch.empty(self.num_experts * self.rank, self.in_features)
+        device = self.A_static.device
+        dtype = self.A_static.dtype
+        flat_A = torch.empty(self.num_experts * self.rank, self.in_features, dtype=torch.float32)
         nn.init.orthogonal_(flat_A)
         with torch.no_grad():
-            self.A_static.copy_(flat_A.view(self.num_experts, self.rank, self.in_features))
+            self.A_static.copy_(flat_A.view(self.num_experts, self.rank, self.in_features).to(device=device, dtype=dtype))
             # Small non-zero Gaussian initialization for B_static so router gets gradient at step 0
-            nn.init.normal_(self.B_static, mean=0.0, std=1e-4)
-            nn.init.kaiming_uniform_(self.router_weight, a=math.sqrt(5))
-            nn.init.zeros_(self.router_bias)
+            b_init = torch.empty_like(self.B_static, dtype=torch.float32)
+            nn.init.normal_(b_init, mean=0.0, std=1e-4)
+            self.B_static.copy_(b_init.to(device=device, dtype=dtype))
+
+            rw_init = torch.empty_like(self.router_weight, dtype=torch.float32)
+            nn.init.kaiming_uniform_(rw_init, a=math.sqrt(5))
+            self.router_weight.copy_(rw_init.to(device=device, dtype=dtype))
+            self.router_bias.zero_()
+
             # Initialize A_dyn orthogonally as well
-            nn.init.orthogonal_(self.A_dyn)
+            flat_A_dyn = torch.empty(self.rank, self.in_features, dtype=torch.float32)
+            nn.init.orthogonal_(flat_A_dyn)
+            self.A_dyn.copy_(flat_A_dyn.to(device=device, dtype=dtype))
 
     @torch.no_grad()
     def expand_for_stage2_surgery(
@@ -129,7 +142,9 @@ class MetaMoLELinear(nn.Module):
 
         # Activate Scratchpad & Meta-SGD step sizes if this layer participates in TTT
         if self.is_ttt_layer:
-            nn.init.orthogonal_(self.A_dyn)
+            flat_A_dyn = torch.empty(self.rank, self.in_features, dtype=torch.float32)
+            nn.init.orthogonal_(flat_A_dyn)
+            self.A_dyn.copy_(flat_A_dyn.to(device=device, dtype=dtype))
             self.B_dyn.zero_()
             self.A_dyn.requires_grad = True
             self.B_dyn.requires_grad = True
@@ -197,12 +212,19 @@ class MetaMoLELinear(nn.Module):
             r_weight = self.router_weight
             r_bias = self.router_bias
 
+        if r_weight.dtype != x.dtype:
+            r_weight = r_weight.to(x.dtype)
+            r_bias = r_bias.to(x.dtype)
+
         logits = F.linear(x, r_weight, r_bias) / self.router_temp
         gates = F.softmax(logits, dim=-1)
 
         # Batched static experts: x [..., d_in] -> [..., N, r] -> [..., N, d_out]
-        static_hidden = torch.einsum("...d,nrd->...nr", x, self.A_static)
-        static_out = torch.einsum("...nr,ndr->...nd", static_hidden, self.B_static)
+        A_static = self.A_static.to(x.dtype) if self.A_static.dtype != x.dtype else self.A_static
+        B_static = self.B_static.to(x.dtype) if self.B_static.dtype != x.dtype else self.B_static
+
+        static_hidden = torch.einsum("...d,nrd->...nr", x, A_static)
+        static_out = torch.einsum("...nr,ndr->...nd", static_hidden, B_static)
         static_out = self.expert_norm(static_out)
 
         if self.stage == 1:
@@ -222,6 +244,9 @@ class MetaMoLELinear(nn.Module):
         else:
             curr_A_dyn = self.A_dyn
             curr_B_dyn = self.B_dyn
+
+        curr_A_dyn = curr_A_dyn.to(x.dtype) if curr_A_dyn.dtype != x.dtype else curr_A_dyn
+        curr_B_dyn = curr_B_dyn.to(x.dtype) if curr_B_dyn.dtype != x.dtype else curr_B_dyn
 
         dyn_hidden = F.linear(x, curr_A_dyn)  # [..., r]
         dyn_out = F.linear(dyn_hidden, curr_B_dyn)  # [..., d_out]

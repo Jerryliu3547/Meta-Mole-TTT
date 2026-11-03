@@ -69,6 +69,11 @@ class MetaMoLEModel(nn.Module):
         self.mole_layers: List[MetaMoLELinear] = []
         self._inject_mole_layers()
 
+        # Ensure all injected parameters match base model device and dtype
+        base_param = next(self.base_model.parameters(), None)
+        if base_param is not None:
+            self.to(device=base_param.device, dtype=base_param.dtype)
+
     def _get_transformer_layers(self) -> List[nn.Module]:
         """Detects Transformer decoder block list across standard HF models."""
         for attr in ["model.layers", "transformer.h", "layers", "decoder.layers"]:

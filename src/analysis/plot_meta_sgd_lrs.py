@@ -62,7 +62,7 @@ def plot_meta_sgd_lrs(
     plt.bar(x + width, lr_dict["eta_B_dyn"], width, label=r"Scratchpad Up $\eta_{B_{\rm dyn}}$", color="#ff7f0e")
 
     plt.xlabel("Layer Index (Depth)", fontsize=13)
-    plt.ylabel("Learned Step Size $\eta = \mathrm{Softplus}(\widetilde{\eta})$", fontsize=13)
+    plt.ylabel(r"Learned Step Size $\eta = \mathrm{Softplus}(\widetilde{\eta})$", fontsize=13)
     plt.title(title, fontsize=14, fontweight="bold")
     plt.xticks(x, [f"L{i+1}" for i in x])
     plt.grid(True, linestyle=":", alpha=0.6, axis="y")
