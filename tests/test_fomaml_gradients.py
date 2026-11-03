@@ -40,7 +40,7 @@ def test_fomaml_and_meta_sgd_gradient_flow():
     r_w_0 = layer.router_weight
     r_b_0 = layer.router_bias
     a_d_0 = layer.A_dyn
-    b_d_0 = torch.zeros_like(layer.B_dyn)
+    b_d_0 = torch.zeros_like(layer.B_dyn).requires_grad_(True)
 
     layer.set_adapted_params({
         "router_weight": r_w_0,

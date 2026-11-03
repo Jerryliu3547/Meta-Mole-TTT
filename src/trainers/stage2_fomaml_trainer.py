@@ -117,7 +117,7 @@ class Stage2FOMAMLTrainer:
                 "router_weight": layer.router_weight,
                 "router_bias": layer.router_bias,
                 "A_dyn": layer.A_dyn,
-                "B_dyn": torch.zeros_like(layer.B_dyn),  # B_dyn^(0) = 0
+                "B_dyn": torch.zeros_like(layer.B_dyn).requires_grad_(True),  # B_dyn^(0) = 0
             })
 
         # Run k inner steps

@@ -16,6 +16,8 @@ logs/
 
 # Generated artifacts & figures
 artifacts/
+*.tar.gz
+*.zip
 
 # Environment
 .env
