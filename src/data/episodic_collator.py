@@ -167,7 +167,7 @@ def create_stage2_episodic_loader(
                     inst = f"{inst}\n{ex['input']}"
                 resp = ex.get("output") or ex.get("response") or ex.get("completion") or ex.get("answer") or ""
                 if inst and resp:
-                    cluster_id = f"task_{count % 20}"
+                    cluster_id = f"task_{count // 50}"
                     task_clusters.setdefault(cluster_id, []).append({"instruction": str(inst), "response": str(resp)})
                     count += 1
                 if count >= 1000:

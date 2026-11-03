@@ -27,7 +27,10 @@ from src.data.benchmarks import (
     ARC_AGI_SAMPLE_ITEMS,
     BBH_SAMPLE_ITEMS,
     GSM_SYMBOLIC_SAMPLE_ITEMS,
+    PARADIGM_A_SAMPLE_ITEMS,
     evaluate_model_on_benchmark,
+    extract_answer,
+    load_benchmark_suite,
 )
 from src.data.episodic_collator import create_stage2_episodic_loader
 from src.data.stage1_datamodule import create_stage1_dataloader
@@ -244,13 +247,33 @@ def run_evaluation(cfg: Dict[str, Any], device: torch.device):
     row2 = f"{'2. Static Collaborative MoLE (No TTT)':<40} | {res_static_bbh['accuracy']*100:.1f}%   | {res_static_arc['accuracy']*100:.1f}%   | {res_static_gsm['accuracy']*100:.1f}%"
     print(row2)
 
-    # 3. Stage 1 MoLE + Ad-Hoc TTT (Reference baseline)
-    row3 = f"{'3. MoLE + Ad-Hoc TTT (No Meta-Train)':<40} | {'44.8%':<8} | {'29.0%':<8} | {'50.4%':<8}"
+    # 3. Stage 1 MoLE + Ad-Hoc TTT (Live evaluation: fixed ad-hoc eta=0.01 without Meta-SGD)
+    engine.inner_steps = orig_inner_steps
+    engine.ad_hoc_eta = 0.01
+    res_adhoc_bbh = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "bbh", BBH_SAMPLE_ITEMS)
+    res_adhoc_arc = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "arc", ARC_AGI_SAMPLE_ITEMS)
+    res_adhoc_gsm = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "gsm", GSM_SYMBOLIC_SAMPLE_ITEMS)
+    row3 = f"{'3. MoLE + Ad-Hoc TTT (No Meta-Train)':<40} | {res_adhoc_bbh['accuracy']*100:.1f}%   | {res_adhoc_arc['accuracy']*100:.1f}%   | {res_adhoc_gsm['accuracy']*100:.1f}%"
     print(row3)
+    engine.ad_hoc_eta = None
 
-    # 4. Single Rank-Matched LoRA + TTT (Reference baseline)
-    row4 = f"{'4. Single LoRA + TTT (Rank-Matched)':<40} | {'46.1%':<8} | {'33.0%':<8} | {'53.2%':<8}"
+    # 4. Single Rank-Matched LoRA + TTT (Live evaluation: single expert route + ad-hoc TTT)
+    engine.inner_steps = orig_inner_steps
+    engine.ad_hoc_eta = 0.01
+    orig_biases = [l.router_bias.clone() for l in mole_model.mole_layers]
+    for l in mole_model.mole_layers:
+        with torch.no_grad():
+            l.router_bias.fill_(-100.0)
+            l.router_bias[0] = 100.0
+    res_lora_bbh = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "bbh", BBH_SAMPLE_ITEMS)
+    res_lora_arc = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "arc", ARC_AGI_SAMPLE_ITEMS)
+    res_lora_gsm = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "gsm", GSM_SYMBOLIC_SAMPLE_ITEMS)
+    row4 = f"{'4. Single LoRA + TTT (Rank-Matched)':<40} | {res_lora_bbh['accuracy']*100:.1f}%   | {res_lora_arc['accuracy']*100:.1f}%   | {res_lora_gsm['accuracy']*100:.1f}%"
     print(row4)
+    for idx, l in enumerate(mole_model.mole_layers):
+        with torch.no_grad():
+            l.router_bias.copy_(orig_biases[idx])
+    engine.ad_hoc_eta = None
 
     # 5. Full Meta-MoLE-TTT (Live evaluation: with k inner TTT steps)
     engine.inner_steps = orig_inner_steps
@@ -276,6 +299,143 @@ def run_evaluation(cfg: Dict[str, Any], device: torch.device):
                 pred_snippet = pred_snippet[:77] + "..."
             status = "✓ PASS" if rec["is_correct"] else "✗ FAIL"
             print(f"[{status}] Task: {rec['task']:<28} | GT: {rec['ground_truth']:<12} | Pred: {rec['extracted']:<12} | Raw: {pred_snippet}")
+
+
+def run_eval100(
+    cfg: Dict[str, Any],
+    device: torch.device,
+    num_test: int = 100,
+    benchmark: str = "gsm8k",
+):
+    print("=" * 70)
+    print(f"LARGE-SCALE EVALUATION: Meta-MoLE-TTT on {num_test} Test Questions ({benchmark.upper()})")
+    print("=" * 70)
+    mole_model, tokenizer = build_model_and_tokenizer(cfg, device)
+    s2_ckpt = cfg["stage2"].get("output_dir", "checkpoints/stage2")
+
+    mole_model.expand_for_stage2_surgery()
+    if os.path.exists(os.path.join(s2_ckpt, "meta_mole_weights.pt")):
+        print(f"[Pipeline] Loading Stage 2 checkpoint from {s2_ckpt}...")
+        mole_model.load_mole_weights(s2_ckpt, strict=False)
+    else:
+        print(f"[Pipeline] Warning: Stage 2 checkpoint not found at {s2_ckpt}. Using initialized weights.")
+
+    engine = TTTInferenceEngine(
+        model=mole_model,
+        tokenizer=tokenizer,
+        inner_steps=cfg["inference"].get("inner_steps", 3),
+        device=device,
+    )
+
+    items = load_benchmark_suite(benchmark=benchmark, num_samples=num_test)
+    print(f"[Evaluation] Successfully loaded {len(items)} test instances.")
+    print(f"[Evaluation] Running test-time adaptation (k={engine.inner_steps} steps) and generation...")
+
+    correct = 0
+    total = len(items)
+    records = []
+    start_time = time.time()
+
+    for idx, item in enumerate(items):
+        pred_text = engine.evaluate_benchmark_item(item)
+        extracted = extract_answer(pred_text, benchmark)
+        gt = item.ground_truth.strip().lower().replace(" ", "").replace(",", "")
+        pred = extracted.strip().lower().replace(" ", "").replace(",", "")
+        is_match = (gt == pred) or (gt in pred) or (pred in gt and len(pred) > 0)
+        if is_match:
+            correct += 1
+
+        records.append({
+            "task": item.task_name,
+            "query": item.query_input,
+            "prediction": extracted,
+            "gt": item.ground_truth,
+            "is_correct": is_match,
+        })
+
+        if (idx + 1) % 10 == 0 or (idx + 1) == total:
+            curr_acc = correct / (idx + 1) * 100
+            elapsed = time.time() - start_time
+            rate = (idx + 1) / elapsed
+            print(
+                f"Progress: [{idx + 1:3d}/{total:3d}] | "
+                f"Correct: {correct:3d} | "
+                f"Current Acc: {curr_acc:.1f}% | "
+                f"Rate: {rate:.2f} items/s | "
+                f"Elapsed: {elapsed:.1f}s"
+            )
+
+    final_acc = (correct / total) * 100 if total > 0 else 0.0
+    print("\n" + "=" * 70)
+    print(f"FINAL 100-TEST RESULT: Meta-MoLE-TTT on {total} questions ({benchmark.upper()})")
+    print(f"Total Correct: {correct} / {total}")
+    print(f"Accuracy:      {final_acc:.2f}%")
+    print("=" * 70)
+
+
+def run_paradigm_a_eval(cfg: Dict[str, Any], device: torch.device):
+    print("=" * 70)
+    print("PARADIGM A EVALUATION: Fast-Weight Scratchpad Memory Retrieval")
+    print("Premise is compiled into B_dyn weights via TTT, then stripped from prompt")
+    print("=" * 70)
+    mole_model, tokenizer = build_model_and_tokenizer(cfg, device)
+    s2_ckpt = cfg["stage2"].get("output_dir", "checkpoints/stage2")
+
+    mole_model.expand_for_stage2_surgery()
+    if os.path.exists(os.path.join(s2_ckpt, "meta_mole_weights.pt")):
+        print(f"[Pipeline] Loading Stage 2 checkpoint from {s2_ckpt}...")
+        mole_model.load_mole_weights(s2_ckpt, strict=False)
+
+    engine = TTTInferenceEngine(
+        model=mole_model,
+        tokenizer=tokenizer,
+        inner_steps=cfg["inference"].get("inner_steps", 3),
+        device=device,
+    )
+
+    items = PARADIGM_A_SAMPLE_ITEMS
+    print(f"\nEvaluating {len(items)} items across Base Model vs. Meta-MoLE-TTT (Paradigm A):\n")
+
+    for idx, item in enumerate(items):
+        print("-" * 70)
+        print(f"Task [{idx+1}/{len(items)}]: {item.task_name}")
+        print(f"Context Premise (TTT Ingestion): \"{item.context_premise}\"")
+        print(f"Isolated Query (Zero Context in Prompt): \"{item.query_input}\"")
+        print(f"Ground Truth: {item.ground_truth}")
+
+        # 1. Base Model (No TTT, adapter scaling = 0, asked query with zero context)
+        orig_scalings = [l.scaling for l in mole_model.mole_layers]
+        for l in mole_model.mole_layers:
+            l.scaling = 0.0
+        base_out = engine.adapt_and_generate(
+            query_prompt=item.query_input,
+            few_shot_demos=None,
+            context_premise=None,
+            max_new_tokens=64,
+        ).strip().replace("\n", " ")
+
+        # Restore scaling
+        for l_i, l in enumerate(mole_model.mole_layers):
+            l.scaling = orig_scalings[l_i]
+
+        # 2. Meta-MoLE-TTT (Paradigm A: compiles premise into B_dyn via TTT, answers query)
+        mole_out = engine.adapt_and_generate(
+            query_prompt=item.query_input,
+            few_shot_demos=None,
+            context_premise=item.context_premise,
+            max_new_tokens=64,
+        ).strip().replace("\n", " ")
+
+        gt = item.ground_truth.lower().strip()
+        base_pass = gt in base_out.lower()
+        mole_pass = gt in mole_out.lower()
+
+        base_status = "✓ PASS" if base_pass else "✗ FAIL"
+        mole_status = "✓ PASS" if mole_pass else "✗ FAIL"
+
+        print(f"  [Base Model (No Memory)] : [{base_status}] Raw: {base_out[:60]}")
+        print(f"  [Meta-MoLE-TTT (Memory)]  : [{mole_status}] Raw: {mole_out[:60]}")
+    print("=" * 70)
 
 
 def run_plot(cfg: Dict[str, Any], device: torch.device):
@@ -318,9 +478,11 @@ def main():
         "--stage",
         type=str,
         default="test",
-        choices=["1", "surgery", "2", "eval", "plot", "test", "full"],
+        choices=["1", "surgery", "2", "eval", "eval100", "paradigm_a", "plot", "test", "full"],
         help="Pipeline stage to execute",
     )
+    parser.add_argument("--num_test", type=int, default=100, help="Number of test instances for large-scale evaluation")
+    parser.add_argument("--benchmark", type=str, default="gsm8k", help="Benchmark dataset (gsm8k, etc.)")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu)")
     args = parser.parse_args()
 
@@ -341,6 +503,10 @@ def main():
         run_stage2(cfg, device)
     elif args.stage == "eval":
         run_evaluation(cfg, device)
+    elif args.stage == "eval100":
+        run_eval100(cfg, device, num_test=args.num_test, benchmark=args.benchmark)
+    elif args.stage == "paradigm_a":
+        run_paradigm_a_eval(cfg, device)
     elif args.stage == "plot":
         run_plot(cfg, device)
     elif args.stage == "full":

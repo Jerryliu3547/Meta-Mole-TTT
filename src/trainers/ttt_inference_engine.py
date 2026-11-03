@@ -40,6 +40,7 @@ class TTTInferenceEngine:
         self.gamma_kl = gamma_kl
         self.gamma_ortho = gamma_ortho
         self.grad_clip = grad_clip
+        self.ad_hoc_eta: Optional[float] = None
 
         if device is None:
             self.device = next(self.model.parameters()).device
@@ -51,10 +52,17 @@ class TTTInferenceEngine:
         self,
         few_shot_demos: Optional[List[Dict[str, str]]] = None,
         query_prompt: str = "",
+        context_premise: Optional[str] = None,
     ) -> Dict[str, torch.Tensor]:
-        """Formats and tokenizes support examples or zero-shot prompt prefix with proper prompt masking."""
-        if few_shot_demos and len(few_shot_demos) > 0:
-            # Few-shot mode: Concatenate demonstrations with prompt masking (-100 on prompt tokens)
+        """Formats and tokenizes support examples, context premise, or zero-shot prompt prefix."""
+        if context_premise:
+            # PARADIGM A: Self-supervised memory compilation of premise into scratchpad weights
+            text = f"<|im_start|>user\n{context_premise}<|im_end|>\n"
+            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+            labels = input_ids.clone()
+        elif few_shot_demos and len(few_shot_demos) > 0:
+            # PARADIGM B: Few-shot demonstration adaptation
             input_ids_list = []
             labels_list = []
             for demo in few_shot_demos:
@@ -138,12 +146,16 @@ class TTTInferenceEngine:
                 b_d = layer_phi["B_dyn"]
 
                 active_tensors.extend([r_w, r_b, a_d, b_d])
-                active_etas.extend([
-                    F.softplus(layer.raw_eta_gate).detach(),
-                    F.softplus(layer.raw_eta_gate).detach(),
-                    F.softplus(layer.raw_eta_A_dyn).detach(),
-                    F.softplus(layer.raw_eta_B_dyn).detach(),
-                ])
+                if self.ad_hoc_eta is not None:
+                    eta_val = torch.tensor(self.ad_hoc_eta, device=self.device)
+                    active_etas.extend([eta_val, eta_val, eta_val, eta_val])
+                else:
+                    active_etas.extend([
+                        F.softplus(layer.raw_eta_gate).detach(),
+                        F.softplus(layer.raw_eta_gate).detach(),
+                        F.softplus(layer.raw_eta_A_dyn).detach(),
+                        F.softplus(layer.raw_eta_B_dyn).detach(),
+                    ])
 
                 if l_idx < len(output.router_gates_list) and l_idx < len(ref_gates):
                     total_kl = total_kl + compute_kl_trust_region_loss(output.router_gates_list[l_idx], ref_gates[l_idx])
@@ -190,18 +202,23 @@ class TTTInferenceEngine:
         self,
         query_prompt: str,
         few_shot_demos: Optional[List[Dict[str, str]]] = None,
+        context_premise: Optional[str] = None,
         max_new_tokens: int = 128,
         do_sample: bool = False,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> str:
         """
-        Adapts parameters on the support context, invalidates KV cache,
+        Adapts parameters on the support context (demos or premise), invalidates KV cache,
         generates continuation with adapted weights, and strictly resets model state.
         """
         try:
             # 1. Adapt on support context
-            support_tensors = self._prepare_support_tensors(few_shot_demos, query_prompt)
+            support_tensors = self._prepare_support_tensors(
+                few_shot_demos=few_shot_demos,
+                query_prompt=query_prompt,
+                context_premise=context_premise,
+            )
             adapted_phi = self._adapt_parameters(support_tensors)
 
             # 2. Apply adapted parameters
@@ -244,11 +261,12 @@ class TTTInferenceEngine:
             # 5. Guaranteed stateless reset
             self.model.reset_adapted_params()
 
-    def evaluate_benchmark_item(self, item: BenchmarkItem) -> str:
-        """Adapts on item.few_shot_demos and answers item.query_input."""
+    def evaluate_benchmark_item(self, item: Any) -> str:
+        """Adapts on item.few_shot_demos or item.context_premise and answers item.query_input."""
         return self.adapt_and_generate(
             query_prompt=item.query_input,
-            few_shot_demos=item.few_shot_demos,
+            few_shot_demos=getattr(item, "few_shot_demos", None),
+            context_premise=getattr(item, "context_premise", None),
             max_new_tokens=128,
             do_sample=False,
         )

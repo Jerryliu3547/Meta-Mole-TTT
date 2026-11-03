@@ -16,9 +16,10 @@ class BenchmarkItem:
     """A benchmark evaluation item with support demonstrations and a query question."""
 
     task_name: str
-    few_shot_demos: List[Dict[str, str]]  # list of {"input": ..., "output": ...}
-    query_input: str
-    ground_truth: str
+    few_shot_demos: Optional[List[Dict[str, str]]] = None  # list of {"input": ..., "output": ...}
+    query_input: str = ""
+    ground_truth: str = ""
+    context_premise: Optional[str] = None  # Specific premise to compile into weights for Paradigm A
 
 
 # Sample items for held-out evaluation
@@ -116,6 +117,34 @@ GSM_SYMBOLIC_SAMPLE_ITEMS: List[BenchmarkItem] = [
     ),
 ]
 
+PARADIGM_A_SAMPLE_ITEMS: List[BenchmarkItem] = [
+    BenchmarkItem(
+        task_name="paradigm_a_inventory_math",
+        context_premise="Store inventory and prices: Apples cost $3 each. Melons cost $8 each. Pineapples cost $6 each. Peaches cost $4 each.",
+        query_input="Leo bought 5 apples and 1 melon. How much did he spend in total? Output the final total as #### <number>",
+        ground_truth="23",
+    ),
+    BenchmarkItem(
+        task_name="paradigm_a_entity_location",
+        context_premise="Employee directory: Alice is stationed in Berlin. Bob is stationed in Tokyo. Charlie is stationed in New York. David is stationed in Sydney.",
+        query_input="Which city is Charlie stationed in?",
+        ground_truth="New York",
+    ),
+    BenchmarkItem(
+        task_name="paradigm_a_secret_code",
+        context_premise="Mission code words: Project Apollo has code 7492. Project Mercury has code 3180. Project Gemini has code 5821.",
+        query_input="What is the code for Project Mercury? Output only the number.",
+        ground_truth="3180",
+    ),
+    BenchmarkItem(
+        task_name="paradigm_a_reasoning_rule",
+        context_premise="Rules of the royal guard: All knights must wear green armor. All squires must wear blue armor. All archers must wear black armor.",
+        query_input="What color armor do squires wear?",
+        ground_truth="blue",
+    ),
+]
+
+
 
 def extract_answer(generated_text: str, benchmark_name: str) -> str:
     """Extracts target answer string from model output according to benchmark format."""
@@ -123,11 +152,15 @@ def extract_answer(generated_text: str, benchmark_name: str) -> str:
 
     if "gsm" in benchmark_name.lower():
         # Look for #### 123 pattern
-        match = re.search(r"####\s*(-?\d+)", text)
+        match = re.search(r"####\s*(-?\d+[\d,]*)", text)
         if match:
-            return match.group(1).strip()
+            return match.group(1).replace(",", "").strip()
+        # Look for "The answer is 123" or "= 123"
+        ans_match = re.search(r"(?:answer is|=)\s*(-?\d+[\d,]*)", text, re.IGNORECASE)
+        if ans_match:
+            return ans_match.group(1).replace(",", "").strip()
         # Fallback to last number in text
-        numbers = re.findall(r"-?\d+", text)
+        numbers = re.findall(r"-?\d+", text.replace(",", ""))
         return numbers[-1] if numbers else text
 
     if "bbh" in benchmark_name.lower():
@@ -200,3 +233,69 @@ def evaluate_model_on_benchmark(
         "total": total,
         "records": records,
     }
+
+
+def load_benchmark_suite(
+    benchmark: str = "gsm8k",
+    num_samples: int = 100,
+) -> List[BenchmarkItem]:
+    """
+    Loads benchmark instances (e.g. 100 questions) for large-scale evaluation.
+    Supports GSM8K and multi-task reasoning with real datasets and robust fallbacks.
+    """
+    items: List[BenchmarkItem] = []
+
+    gsm_demos = [
+        {
+            "input": "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
+            "output": "There are 15 trees originally. Then there were 21 trees after some more were planted. So there must have been 21 - 15 = 6 trees planted. #### 6",
+        },
+        {
+            "input": "If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?",
+            "output": "There are originally 3 cars. 2 more arrive. 3 + 2 = 5 cars. #### 5",
+        },
+    ]
+
+    if "gsm" in benchmark.lower():
+        try:
+            from datasets import load_dataset
+            print(f"[Benchmark] Fetching {num_samples} items from official openai/gsm8k test split...")
+            raw = load_dataset("openai/gsm8k", "main", split="test")
+            for i, row in enumerate(raw):
+                if len(items) >= num_samples:
+                    break
+                q = row["question"]
+                a = row["answer"]
+                m = re.search(r"####\s*(-?\d+[\d,]*)", a)
+                gt = m.group(1).replace(",", "").strip() if m else a.split()[-1]
+                items.append(
+                    BenchmarkItem(
+                        task_name=f"gsm8k_{i+1}",
+                        few_shot_demos=gsm_demos,
+                        query_input=q,
+                        ground_truth=gt,
+                    )
+                )
+            print(f"[Benchmark] Successfully loaded {len(items)} GSM8K test questions.")
+        except Exception as e:
+            print(f"[Benchmark] Warning: Could not load GSM8K from Hugging Face ({e}). Generating parameterized problems.")
+            items = []
+
+        if not items:
+            for i in range(num_samples):
+                a = (i * 7 + 13) % 40 + 5
+                b = (i * 3 + 17) % 25 + 3
+                c = (i * 5 + 11) % 15 + 2
+                ans = (a * b) + c
+                q = f"A store sells packs of pens with {a} pens in each pack. John bought {b} packs and found {c} loose pens at home. How many pens does John have in total?"
+                items.append(
+                    BenchmarkItem(
+                        task_name=f"gsm_param_{i+1}",
+                        few_shot_demos=gsm_demos,
+                        query_input=q,
+                        ground_truth=str(ans),
+                    )
+                )
+
+    return items[:num_samples]
+

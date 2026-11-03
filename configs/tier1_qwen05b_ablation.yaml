@@ -5,7 +5,7 @@ model:
   name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
   num_experts: 6
   rank: 8
-  alpha: 8.0
+  alpha: 0.4
   router_temp: 1.0
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
   ttt_layer_indices: "upper_half"

@@ -5,7 +5,7 @@ model:
   name_or_path: "HuggingFaceTB/SmolLM2-135M-Instruct"
   num_experts: 4
   rank: 4
-  alpha: 16.0
+  alpha: 0.2
   router_temp: 1.0
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
   ttt_layer_indices: "upper_half"
