@@ -180,7 +180,6 @@ class TTTInferenceEngine:
 
         return current_phi
 
-    @torch.no_grad()
     def adapt_and_generate(
         self,
         query_prompt: str,
@@ -227,7 +226,8 @@ class TTTInferenceEngine:
             else:
                 generate_kwargs.update({"do_sample": False})
 
-            output_ids = self.model.generate(**generate_kwargs)
+            with torch.no_grad():
+                output_ids = self.model.generate(**generate_kwargs)
 
             # Decode only the generated completion tokens
             gen_tokens = output_ids[0][input_ids.shape[1] :]
