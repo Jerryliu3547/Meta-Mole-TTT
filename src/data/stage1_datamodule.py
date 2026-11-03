@@ -144,11 +144,14 @@ def create_stage1_dataloader(
             raw_data = load_dataset(dataset_name_or_path, split="train")
             for ex in raw_data:
                 inst = ex.get("instruction") or ex.get("prompt") or ex.get("question") or ""
-                resp = ex.get("response") or ex.get("completion") or ex.get("answer") or ""
+                if ex.get("input"):
+                    inst = f"{inst}\n{ex['input']}"
+                resp = ex.get("output") or ex.get("response") or ex.get("completion") or ex.get("answer") or ""
                 if inst and resp:
                     samples.append({"instruction": str(inst), "response": str(resp)})
                 if len(samples) >= num_samples:
                     break
+            print(f"[Stage1 Data] Loaded {len(samples)} examples from {dataset_name_or_path}.")
         except Exception as e:
             print(f"[Stage1 Data] Warning: Could not load {dataset_name_or_path} ({e}). Using synthetic multi-task mixture.")
             samples = []

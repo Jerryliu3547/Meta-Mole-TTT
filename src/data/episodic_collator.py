@@ -48,7 +48,7 @@ class EpisodicTaskDataset(Dataset):
         self.episode_length = max(2, episode_length)
 
     def __len__(self) -> int:
-        return sum(len(cluster) for cluster in self.task_clusters.values())
+        return max(1, sum(len(cluster) for cluster in self.task_clusters.values()))
 
     def __getitem__(self, idx: int) -> EpisodicTaskBatch:
         # Select random task cluster
@@ -160,19 +160,27 @@ def create_stage2_episodic_loader(
             from datasets import load_dataset
             raw_data = load_dataset(dataset_name_or_path, split="train")
             task_clusters = {}
+            count = 0
             for i, ex in enumerate(raw_data):
                 inst = ex.get("instruction") or ex.get("prompt") or ex.get("question") or ""
-                resp = ex.get("response") or ex.get("completion") or ex.get("answer") or ""
+                if ex.get("input"):
+                    inst = f"{inst}\n{ex['input']}"
+                resp = ex.get("output") or ex.get("response") or ex.get("completion") or ex.get("answer") or ""
                 if inst and resp:
-                    cluster_id = f"task_{i % 10}"
+                    cluster_id = f"task_{count % 20}"
                     task_clusters.setdefault(cluster_id, []).append({"instruction": str(inst), "response": str(resp)})
-                if i >= 1000:
+                    count += 1
+                if count >= 1000:
                     break
+            if task_clusters:
+                print(f"[Stage2 Data] Loaded {count} examples across {len(task_clusters)} clusters from {dataset_name_or_path}.")
+            else:
+                task_clusters = None
         except Exception as e:
             print(f"[Stage2 Data] Warning: Could not load {dataset_name_or_path} ({e}). Using synthetic clusters.")
             task_clusters = None
 
-    if task_clusters is None:
+    if not task_clusters:
         # Group fallback templates by task_type
         task_clusters = {}
         for p in SAMPLE_MULTI_TASK_PROMPTS:
