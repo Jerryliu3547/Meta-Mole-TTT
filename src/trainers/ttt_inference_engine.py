@@ -52,15 +52,21 @@ class TTTInferenceEngine:
         few_shot_demos: Optional[List[Dict[str, str]]] = None,
         query_prompt: str = "",
     ) -> Dict[str, torch.Tensor]:
-        """Formats and tokenizes support examples or zero-shot prompt prefix."""
+        """Formats and tokenizes support examples or zero-shot prompt prefix with proper prompt masking."""
         if few_shot_demos and len(few_shot_demos) > 0:
-            # Few-shot mode: Concatenate demonstrations
-            text = ""
+            # Few-shot mode: Concatenate demonstrations with prompt masking (-100 on prompt tokens)
+            input_ids_list = []
+            labels_list = []
             for demo in few_shot_demos:
-                text += f"<|im_start|>user\n{demo['input']}<|im_end|>\n<|im_start|>assistant\n{demo['output']}<|im_end|>\n"
-            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
-            input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-            labels = input_ids.clone()
+                p_text = f"<|im_start|>user\n{demo['input']}<|im_end|>\n<|im_start|>assistant\n"
+                r_text = f"{demo['output']}<|im_end|>\n"
+                p_ids = self.tokenizer.encode(p_text, add_special_tokens=False)
+                r_ids = self.tokenizer.encode(r_text, add_special_tokens=False)
+                input_ids_list.extend(p_ids + r_ids)
+                labels_list.extend([-100] * len(p_ids) + r_ids)
+
+            input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
+            labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
         else:
             # Zero-shot self-supervised mode: Use prompt prefix
             text = f"<|im_start|>user\n{query_prompt}<|im_end|>\n<|im_start|>assistant\n"

@@ -145,6 +145,7 @@ class EpisodicTaskDataset(Dataset):
 def create_stage2_episodic_loader(
     tokenizer: PreTrainedTokenizer,
     task_clusters: Optional[Dict[str, List[Dict[str, str]]]] = None,
+    dataset_name_or_path: Optional[str] = None,
     max_length: int = 512,
     self_supervised_ratio: float = 0.3,
     episode_length: int = 4,
@@ -152,8 +153,25 @@ def create_stage2_episodic_loader(
 ) -> List[EpisodicTaskBatch]:
     """
     Creates a collection of episodic batches for Stage 2 FOMAML training.
-    If task_clusters is not provided, builds clusters from multi-task sample prompts.
+    If task_clusters is not provided, builds clusters from dataset_name_or_path or fallback prompts.
     """
+    if task_clusters is None and dataset_name_or_path and dataset_name_or_path != "synthetic":
+        try:
+            from datasets import load_dataset
+            raw_data = load_dataset(dataset_name_or_path, split="train")
+            task_clusters = {}
+            for i, ex in enumerate(raw_data):
+                inst = ex.get("instruction") or ex.get("prompt") or ex.get("question") or ""
+                resp = ex.get("response") or ex.get("completion") or ex.get("answer") or ""
+                if inst and resp:
+                    cluster_id = f"task_{i % 10}"
+                    task_clusters.setdefault(cluster_id, []).append({"instruction": str(inst), "response": str(resp)})
+                if i >= 1000:
+                    break
+        except Exception as e:
+            print(f"[Stage2 Data] Warning: Could not load {dataset_name_or_path} ({e}). Using synthetic clusters.")
+            task_clusters = None
+
     if task_clusters is None:
         # Group fallback templates by task_type
         task_clusters = {}

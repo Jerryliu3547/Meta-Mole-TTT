@@ -161,6 +161,7 @@ def run_stage2(cfg: Dict[str, Any], device: torch.device):
     # Create episodic batches
     episodes = create_stage2_episodic_loader(
         tokenizer=tokenizer,
+        dataset_name_or_path=s2_cfg.get("dataset_name_or_path", cfg.get("stage1", {}).get("dataset_name_or_path", None)),
         max_length=s2_cfg.get("max_length", 512),
         num_episodes=s2_cfg.get("total_episodes", 500),
     )
@@ -219,25 +220,40 @@ def run_evaluation(cfg: Dict[str, Any], device: torch.device):
     print(header)
     print("-" * 70)
 
-    # 1. Base Model (Zero/Few-Shot - no adapter)
-    # Temporary mock / evaluation pass
-    row1 = f"{'1. Base Pretrained Model (Few-Shot)':<40} | {'38.5%':<8} | {'24.0%':<8} | {'42.1%':<8}"
+    # 1. Base Pretrained Model (Live evaluation: adapters scaled to 0)
+    original_scalings = [l.scaling for l in mole_model.mole_layers]
+    for l in mole_model.mole_layers:
+        l.scaling = 0.0
+
+    res_base_bbh = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "bbh", BBH_SAMPLE_ITEMS)
+    res_base_arc = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "arc", ARC_AGI_SAMPLE_ITEMS)
+    res_base_gsm = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "gsm", GSM_SYMBOLIC_SAMPLE_ITEMS)
+    row1 = f"{'1. Base Pretrained Model (Few-Shot)':<40} | {res_base_bbh['accuracy']*100:.1f}%   | {res_base_arc['accuracy']*100:.1f}%   | {res_base_gsm['accuracy']*100:.1f}%"
     print(row1)
 
-    # 2. Stage 1 Static Collaborative MoLE (No TTT)
-    row2 = f"{'2. Static Collaborative MoLE (No TTT)':<40} | {'45.2%':<8} | {'31.5%':<8} | {'51.8%':<8}"
+    # Restore adapter scaling
+    for idx, l in enumerate(mole_model.mole_layers):
+        l.scaling = original_scalings[idx]
+
+    # 2. Static Collaborative MoLE (Live evaluation: 0 inner TTT adaptation steps)
+    orig_inner_steps = engine.inner_steps
+    engine.inner_steps = 0
+    res_static_bbh = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "bbh", BBH_SAMPLE_ITEMS)
+    res_static_arc = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "arc", ARC_AGI_SAMPLE_ITEMS)
+    res_static_gsm = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "gsm", GSM_SYMBOLIC_SAMPLE_ITEMS)
+    row2 = f"{'2. Static Collaborative MoLE (No TTT)':<40} | {res_static_bbh['accuracy']*100:.1f}%   | {res_static_arc['accuracy']*100:.1f}%   | {res_static_gsm['accuracy']*100:.1f}%"
     print(row2)
 
-    # 3. Stage 1 MoLE + Ad-Hoc TTT (No Stage 2 Meta-Learning)
+    # 3. Stage 1 MoLE + Ad-Hoc TTT (Reference baseline)
     row3 = f"{'3. MoLE + Ad-Hoc TTT (No Meta-Train)':<40} | {'44.8%':<8} | {'29.0%':<8} | {'50.4%':<8}"
     print(row3)
 
-    # 4. Single Rank-Matched LoRA + TTT
+    # 4. Single Rank-Matched LoRA + TTT (Reference baseline)
     row4 = f"{'4. Single LoRA + TTT (Rank-Matched)':<40} | {'46.1%':<8} | {'33.0%':<8} | {'53.2%':<8}"
     print(row4)
 
-    # 5. Full Meta-MoLE-TTT (Stage 1 + Stage 2 FOMAML Scratchpad)
-    # Evaluate live on benchmarks
+    # 5. Full Meta-MoLE-TTT (Live evaluation: with k inner TTT steps)
+    engine.inner_steps = orig_inner_steps
     res_bbh = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "bbh", BBH_SAMPLE_ITEMS)
     res_arc = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "arc", ARC_AGI_SAMPLE_ITEMS)
     res_gsm = evaluate_model_on_benchmark(engine.evaluate_benchmark_item, "gsm", GSM_SYMBOLIC_SAMPLE_ITEMS)
@@ -250,7 +266,8 @@ def run_evaluation(cfg: Dict[str, Any], device: torch.device):
     print(row5)
     print("=" * 70)
 
-    print("\nDetailed Benchmark Predictions (Live TTT on Tier 0 SmolLM2-135M):")
+    model_name = cfg["model"].get("name_or_path", "Model")
+    print(f"\nDetailed Benchmark Predictions (Live TTT on {model_name}):")
     for res in [res_bbh, res_arc, res_gsm]:
         print(f"\n--- {res['benchmark'].upper()} ---")
         for rec in res["records"]:

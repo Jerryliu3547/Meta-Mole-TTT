@@ -5,17 +5,18 @@ model:
   name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
   num_experts: 6
   rank: 8
-  alpha: 16.0
+  alpha: 8.0
   router_temp: 1.0
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
   ttt_layer_indices: "upper_half"
 
 stage1:
-  lr_experts: 2.0e-4
+  dataset_name_or_path: "yahma/alpaca-cleaned"
+  lr_experts: 1.0e-4
   lr_router: 5.0e-4
   weight_decay: 0.01
-  total_steps: 1000
-  warmup_steps: 100
+  total_steps: 500
+  warmup_steps: 50
   batch_size: 4
   max_length: 512
   lambda_bal: 0.01
@@ -23,7 +24,7 @@ stage1:
   lambda_ortho: 0.05
   temp_start: 1.5
   temp_end: 0.7
-  logging_steps: 20
+  logging_steps: 25
   save_steps: 250
   output_dir: "checkpoints/tier1/stage1"
 
@@ -33,7 +34,7 @@ surgery:
   output_dir: "checkpoints/tier1/stage2_init"
 
 stage2:
-  inner_steps: 3
+  inner_steps: 2
   meta_lr_gate: 2.0e-4
   meta_lr_scratchpad: 2.0e-4
   meta_lr_eta: 1.0e-3
@@ -41,9 +42,9 @@ stage2:
   gamma_ortho: 0.05
   lambda_kl: 0.1
   meta_batch_size: 2
-  total_episodes: 500
+  total_episodes: 200
   max_length: 512
-  logging_episodes: 10
+  logging_episodes: 20
   save_episodes: 100
   output_dir: "checkpoints/tier1/stage2"
 
