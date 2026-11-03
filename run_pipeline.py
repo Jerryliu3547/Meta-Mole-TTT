@@ -15,6 +15,8 @@ import os
 import sys
 from typing import Any, Dict
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import yaml

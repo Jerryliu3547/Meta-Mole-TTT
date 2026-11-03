@@ -16,7 +16,7 @@ stage1:
   weight_decay: 0.01
   total_steps: 1000
   warmup_steps: 100
-  batch_size: 16
+  batch_size: 4
   max_length: 512
   lambda_bal: 0.01
   lambda_z: 1.0e-3
@@ -40,7 +40,7 @@ stage2:
   gamma_kl: 0.1
   gamma_ortho: 0.05
   lambda_kl: 0.1
-  meta_batch_size: 4
+  meta_batch_size: 2
   total_episodes: 500
   max_length: 512
   logging_episodes: 10
