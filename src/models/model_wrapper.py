@@ -270,8 +270,22 @@ class MetaMoLEModel(nn.Module):
         }
 
     def generate(self, *args, **kwargs):
-        """Pass-through to base_model.generate()."""
-        return self.base_model.generate(*args, **kwargs)
+        """Pass-through to base_model.generate() with forward hooks to unwrap module outputs."""
+        handles = []
+
+        def generate_hook(module, args, output):
+            if isinstance(output, tuple):
+                return output[0]
+            return output
+
+        for layer in self.mole_layers:
+            handles.append(layer.register_forward_hook(generate_hook))
+
+        try:
+            return self.base_model.generate(*args, **kwargs)
+        finally:
+            for h in handles:
+                h.remove()
 
     def save_mole_weights(self, output_dir: str):
         """Saves only the Meta-MoLE trainable weights (lightweight checkpoint)."""

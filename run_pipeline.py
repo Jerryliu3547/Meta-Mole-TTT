@@ -49,7 +49,10 @@ def build_model_and_tokenizer(cfg: Dict[str, Any], device: torch.device):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        dtype = torch.float32
 
     base_model = AutoModelForCausalLM.from_pretrained(
         model_name,
@@ -82,6 +85,7 @@ def run_stage1(cfg: Dict[str, Any], device: torch.device):
 
     train_loader = create_stage1_dataloader(
         tokenizer=tokenizer,
+        dataset_name_or_path=s1_cfg.get("dataset_name_or_path", None),
         batch_size=s1_cfg.get("batch_size", 16),
         max_length=s1_cfg.get("max_length", 512),
         num_samples=s1_cfg.get("total_steps", 1000) * s1_cfg.get("batch_size", 16),
@@ -243,6 +247,16 @@ def run_evaluation(cfg: Dict[str, Any], device: torch.device):
     row5 = f"{'5. Meta-MoLE-TTT (Full Proposed)':<40} | {acc_bbh:<8} | {acc_arc:<8} | {acc_gsm:<8}"
     print(row5)
     print("=" * 70)
+
+    print("\nDetailed Benchmark Predictions (Live TTT on Tier 0 SmolLM2-135M):")
+    for res in [res_bbh, res_arc, res_gsm]:
+        print(f"\n--- {res['benchmark'].upper()} ---")
+        for rec in res["records"]:
+            pred_snippet = rec["prediction_raw"].replace("\n", " ").strip()
+            if len(pred_snippet) > 80:
+                pred_snippet = pred_snippet[:77] + "..."
+            status = "✓ PASS" if rec["is_correct"] else "✗ FAIL"
+            print(f"[{status}] Task: {rec['task']:<28} | GT: {rec['ground_truth']:<12} | Pred: {rec['extracted']:<12} | Raw: {pred_snippet}")
 
 
 def run_plot(cfg: Dict[str, Any], device: torch.device):
