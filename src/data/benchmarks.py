@@ -121,7 +121,7 @@ PARADIGM_A_SAMPLE_ITEMS: List[BenchmarkItem] = [
     BenchmarkItem(
         task_name="paradigm_a_inventory_math",
         context_premise="Store inventory and prices: Apples cost $3 each. Melons cost $8 each. Pineapples cost $6 each. Peaches cost $4 each.",
-        query_input="Leo bought 5 apples and 1 melon. How much did he spend in total? Output the final total as #### <number>",
+        query_input="Leo bought 5 apples and 1 melon. How much did he spend in total? Calculate step by step and output the final total as #### <number>",
         ground_truth="23",
     ),
     BenchmarkItem(

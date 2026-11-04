@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from transformers import PreTrainedTokenizer
 
 from ..data.benchmarks import BenchmarkItem
+from ..data.paradigm_a_datamodule import format_compiled_support_batch
 from ..models.model_wrapper import MetaMoLEModel
 from ..models.regularizers import (
     compute_dynamic_orthogonality_loss,
@@ -57,11 +58,17 @@ class TTTInferenceEngine:
         """Formats and tokenizes support examples, context premise, or zero-shot prompt prefix."""
         if context_premise:
             # PARADIGM A: Self-supervised memory compilation of premise into scratchpad weights
-            text = f"<|im_start|>user\n{context_premise}<|im_end|>\n"
-            token_ids = self.tokenizer.encode(text, add_special_tokens=False)
-            input_ids = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-            labels = input_ids.clone()
+            # Compiles premise into subspace-aligned recall pairs matching Stage 2 training
+            compiled = format_compiled_support_batch(
+                premise=context_premise,
+                tokenizer=self.tokenizer,
+                max_length=512,
+                device=self.device,
+            )
+            compiled["is_memory"] = torch.tensor(1.0, device=self.device)
+            return compiled
         elif few_shot_demos and len(few_shot_demos) > 0:
+            is_memory = False
             # PARADIGM B: Few-shot demonstration adaptation
             input_ids_list = []
             labels_list = []
@@ -76,6 +83,7 @@ class TTTInferenceEngine:
             input_ids = torch.tensor([input_ids_list], dtype=torch.long, device=self.device)
             labels = torch.tensor([labels_list], dtype=torch.long, device=self.device)
         else:
+            is_memory = False
             # Zero-shot self-supervised mode: Use prompt prefix
             text = f"<|im_start|>user\n{query_prompt}<|im_end|>\n<|im_start|>assistant\n"
             token_ids = self.tokenizer.encode(text, add_special_tokens=False)
@@ -83,11 +91,14 @@ class TTTInferenceEngine:
             labels = input_ids.clone()
 
         attention_mask = torch.ones_like(input_ids)
-        return {
+        res = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
         }
+        if is_memory:
+            res["is_memory"] = torch.tensor(1.0, device=self.device)
+        return res
 
     def _adapt_parameters(
         self,
@@ -149,6 +160,14 @@ class TTTInferenceEngine:
                 if self.ad_hoc_eta is not None:
                     eta_val = torch.tensor(self.ad_hoc_eta, device=self.device)
                     active_etas.extend([eta_val, eta_val, eta_val, eta_val])
+                elif "is_memory" in support_tensors:
+                    # Use meta-learned step sizes with a floor for high-fidelity fast-weight storage
+                    active_etas.extend([
+                        torch.clamp(F.softplus(layer.raw_eta_gate).detach(), min=0.05),
+                        torch.clamp(F.softplus(layer.raw_eta_gate).detach(), min=0.05),
+                        torch.clamp(F.softplus(layer.raw_eta_A_dyn).detach(), min=0.05),
+                        torch.clamp(F.softplus(layer.raw_eta_B_dyn).detach(), min=0.18),
+                    ])
                 else:
                     active_etas.extend([
                         F.softplus(layer.raw_eta_gate).detach(),
@@ -158,7 +177,11 @@ class TTTInferenceEngine:
                     ])
 
                 if l_idx < len(output.router_gates_list) and l_idx < len(ref_gates):
-                    total_kl = total_kl + compute_kl_trust_region_loss(output.router_gates_list[l_idx], ref_gates[l_idx])
+                    total_kl = total_kl + compute_kl_trust_region_loss(
+                        output.router_gates_list[l_idx],
+                        ref_gates[l_idx],
+                        num_static_experts=layer.num_experts,
+                    )
 
                 total_ortho = total_ortho + compute_dynamic_orthogonality_loss(a_d, layer.A_static)
                 ttt_idx += 1
@@ -187,7 +210,8 @@ class TTTInferenceEngine:
                     if g is None:
                         g = torch.zeros_like(p_curr)
 
-                    g_clipped = torch.clamp(g.detach(), -self.grad_clip, self.grad_clip)
+                    g_norm = torch.norm(g.detach(), p="fro") + 1e-6
+                    g_clipped = torch.clamp(g.detach() / g_norm, -self.grad_clip, self.grad_clip)
                     # Test-time update
                     p_next = (p_curr.detach() - eta * g_clipped).detach().requires_grad_(True)
                     next_layer_phi[key] = p_next
@@ -225,7 +249,7 @@ class TTTInferenceEngine:
             self.model.set_adapted_params(adapted_phi)
 
             # 3. Format target prompt for generation
-            # Prepend few-shot demonstrations to context if present
+            # Zero context in prompt for memory retrieval; isolated question directly targets memory
             full_prompt = ""
             if few_shot_demos:
                 for demo in few_shot_demos:

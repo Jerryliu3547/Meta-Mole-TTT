@@ -126,17 +126,27 @@ def compute_kl_trust_region_loss(
     gates_curr: torch.Tensor,
     gates_ref: torch.Tensor,
     eps: float = 1e-12,
+    num_static_experts: Optional[int] = None,
 ) -> torch.Tensor:
     """
     KL Trust Region Loss between current router probabilities and reference router:
       D_KL(gates_curr || gates_ref) = sum_i gates_curr_i * log(gates_curr_i / gates_ref_i)
+    When num_static_experts is provided, computes conditional KL over the first N static
+    anchor experts so the (N+1)-th dynamic scratchpad gate can open freely without penalty.
 
     Args:
-        gates_curr: Current router probabilities [..., N]
-        gates_ref: Reference router probabilities at episode start [..., N]
+        gates_curr: Current router probabilities [..., N] or [..., N+1]
+        gates_ref: Reference router probabilities at episode start [..., N] or [..., N+1]
+        num_static_experts: Optional number of static experts N to anchor
     """
-    p = gates_curr.clamp(min=eps)
-    q = gates_ref.clamp(min=eps)
+    if num_static_experts is not None and gates_curr.shape[-1] > num_static_experts:
+        p_raw = gates_curr[..., :num_static_experts].clamp(min=eps)
+        q_raw = gates_ref[..., :num_static_experts].clamp(min=eps)
+        p = p_raw / p_raw.sum(dim=-1, keepdim=True).clamp(min=eps)
+        q = q_raw / q_raw.sum(dim=-1, keepdim=True).clamp(min=eps)
+    else:
+        p = gates_curr.clamp(min=eps)
+        q = gates_ref.clamp(min=eps)
     kl = (p * (torch.log(p) - torch.log(q))).sum(dim=-1).mean()
     return kl
 

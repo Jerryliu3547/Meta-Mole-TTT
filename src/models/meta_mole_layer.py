@@ -52,6 +52,7 @@ class MetaMoLELinear(nn.Module):
         self.num_experts = num_experts
         self.rank = rank
         self.scaling = alpha / rank
+        self.dyn_scaling = 1.0
         self.router_temp = router_temp
         self.is_ttt_layer = is_ttt_layer
         self.stage = 1  # 1 = Pure Collaborative MoLE, 2 = Frozen Anchors + Meta-TTT Scratchpad
@@ -146,6 +147,11 @@ class MetaMoLELinear(nn.Module):
             nn.init.orthogonal_(flat_A_dyn)
             self.A_dyn.copy_(flat_A_dyn.to(device=device, dtype=dtype))
             self.B_dyn.zero_()
+            if scratchpad_bias_init >= 0.0:
+                # Paradigm A fast-weight memory mode: initialize higher write step size (softplus(-1.8) ~= 0.15)
+                self.raw_eta_gate.fill_(-3.0)
+                self.raw_eta_A_dyn.fill_(-3.5)
+                self.raw_eta_B_dyn.fill_(-1.8)
             self.A_dyn.requires_grad = True
             self.B_dyn.requires_grad = True
             self.raw_eta_gate.requires_grad = True
@@ -248,9 +254,9 @@ class MetaMoLELinear(nn.Module):
         curr_A_dyn = curr_A_dyn.to(x.dtype) if curr_A_dyn.dtype != x.dtype else curr_A_dyn
         curr_B_dyn = curr_B_dyn.to(x.dtype) if curr_B_dyn.dtype != x.dtype else curr_B_dyn
 
-        dyn_hidden = F.linear(x, curr_A_dyn)  # [..., r]
+        dyn_hidden = self.expert_norm(F.linear(x, curr_A_dyn))  # [..., r] unit-RMS key activation
         dyn_out = F.linear(dyn_hidden, curr_B_dyn)  # [..., d_out]
         routed_dyn = gate_dyn * dyn_out
 
-        total_out = base_out + self.scaling * (routed_static + routed_dyn)
+        total_out = base_out + self.scaling * routed_static + self.dyn_scaling * routed_dyn
         return total_out, logits, gates

@@ -1,0 +1,57 @@
+# Paradigm A Workload: Fast-Weight Scratchpad Memory & Context Compression
+# Qwen2.5-0.5B-Instruct (4-Pillar Upgraded Architecture)
+
+model:
+  name_or_path: "Qwen/Qwen2.5-0.5B-Instruct"
+  num_experts: 6
+  rank: 8
+  alpha: 0.4
+  router_temp: 1.0
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj"]
+  ttt_layer_indices: "upper_half"
+
+stage1:
+  dataset_name_or_path: "yahma/alpaca-cleaned"
+  lr_experts: 1.0e-4
+  lr_router: 5.0e-4
+  weight_decay: 0.01
+  total_steps: 500
+  warmup_steps: 50
+  batch_size: 4
+  max_length: 512
+  lambda_bal: 0.01
+  lambda_z: 1.0e-3
+  lambda_ortho: 0.05
+  temp_start: 1.5
+  temp_end: 0.7
+  logging_steps: 25
+  save_steps: 250
+  output_dir: "checkpoints/paradigm_a/stage1"
+
+surgery:
+  freeze_static_experts: true
+  scratchpad_bias_init: 0.8
+  stage1_source_dir: "checkpoints/tier1/stage1"
+  output_dir: "checkpoints/paradigm_a/stage2_init"
+
+stage2:
+  dataset_name_or_path: "yahma/alpaca-cleaned"
+  inner_steps: 4
+  meta_lr_gate: 5.0e-4
+  meta_lr_scratchpad: 5.0e-4
+  meta_lr_eta: 2.0e-3
+  gamma_kl: 0.05
+  gamma_ortho: 0.05
+  lambda_kl: 0.05
+  meta_batch_size: 2
+  total_episodes: 300
+  max_length: 512
+  logging_episodes: 20
+  save_episodes: 100
+  output_dir: "checkpoints/paradigm_a/stage2"
+
+inference:
+  inner_steps: 10
+  max_new_tokens: 64
+  temperature: 0.7
+  top_p: 0.9

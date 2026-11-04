@@ -122,6 +122,26 @@ class Stage2FOMAMLTrainer:
 
         # Run k inner steps
         for step_t in range(self.inner_steps):
+            is_last_step = (step_t == self.inner_steps - 1)
+
+            # On the final step, re-attach meta-parameters via straight-through bridge
+            # so create_graph=True differentiates write gradients w.r.t. A_dyn and router
+            if is_last_step and step_t > 0:
+                bridged_phi: List[Dict[str, torch.Tensor]] = []
+                ttt_i = 0
+                for layer in self.model.mole_layers:
+                    if not layer.is_ttt_layer:
+                        continue
+                    c_phi = current_phi[ttt_i]
+                    bridged_phi.append({
+                        "router_weight": layer.router_weight + (c_phi["router_weight"] - layer.router_weight).detach(),
+                        "router_bias": layer.router_bias + (c_phi["router_bias"] - layer.router_bias).detach(),
+                        "A_dyn": layer.A_dyn + (c_phi["A_dyn"] - layer.A_dyn).detach(),
+                        "B_dyn": c_phi["B_dyn"].detach().requires_grad_(True),
+                    })
+                    ttt_i += 1
+                current_phi = bridged_phi
+
             # Apply current phi to model
             self.model.set_adapted_params(current_phi)
 
@@ -133,7 +153,7 @@ class Stage2FOMAMLTrainer:
             )
             s_ce_loss = s_out.loss
 
-            # Compute regularizers: KL divergence from step 0 and Dynamic Subspace Orthogonality
+            # Compute regularizers: Anchor-preserving KL divergence and Dynamic Subspace Orthogonality
             total_inner_kl = torch.tensor(0.0, device=self.device)
             total_inner_ortho = torch.tensor(0.0, device=self.device)
 
@@ -159,10 +179,12 @@ class Stage2FOMAMLTrainer:
                     F.softplus(layer.raw_eta_B_dyn),
                 ])
 
-                # KL Trust Region
+                # Anchor-Preserving KL Trust Region over the N static experts
                 if l_idx < len(s_out.router_gates_list) and l_idx < len(ref_gates_list):
                     total_inner_kl = total_inner_kl + compute_kl_trust_region_loss(
-                        s_out.router_gates_list[l_idx], ref_gates_list[l_idx]
+                        s_out.router_gates_list[l_idx],
+                        ref_gates_list[l_idx],
+                        num_static_experts=layer.num_experts,
                     )
 
                 # Dynamic Orthogonality constraint
@@ -176,15 +198,14 @@ class Stage2FOMAMLTrainer:
             inner_loss = s_ce_loss + (self.gamma_kl * total_inner_kl / num_ttt) + (self.gamma_ortho * total_inner_ortho / num_ttt)
 
             # Compute gradients of inner loss w.r.t active parameters
+            # Retain graph on the final inner step so B_dyn^(k) carries write-phase gradients to A_dyn & router
             inner_grads = torch.autograd.grad(
                 inner_loss,
                 active_tensors,
-                create_graph=False,  # First-order MAML (FOMAML)
+                create_graph=is_last_step,
                 allow_unused=True,
             )
 
-            # Detach gradients and perform Meta-SGD step: phi^(t+1) = phi^(t) - softplus(eta) * g_t
-            # Keeping softplus(eta) in computation graph ensures outer-loop gradients update eta!
             next_phi: List[Dict[str, torch.Tensor]] = []
             tensor_ptr = 0
 
@@ -203,11 +224,16 @@ class Stage2FOMAMLTrainer:
                     if g_curr is None:
                         g_curr = torch.zeros_like(p_curr)
 
-                    # Detach gradient for FOMAML and clip norm
-                    g_detached = torch.clamp(g_curr.detach(), -self.inner_grad_clip, self.inner_grad_clip)
+                    # Frobenius norm normalization for scale-invariant associative updates
+                    g_norm = torch.norm(g_curr.detach(), p="fro") + 1e-6
 
-                    # Meta-SGD update
-                    layer_phi_next[key] = p_curr - eta_curr * g_detached
+                    if is_last_step and key == "B_dyn":
+                        # Keep write-phase graph connected for B_dyn -> A_dyn & router_weight
+                        g_normalized = g_curr / g_norm
+                        layer_phi_next[key] = p_curr.detach() - eta_curr * g_normalized
+                    else:
+                        g_detached = torch.clamp(g_curr.detach() / g_norm, -self.inner_grad_clip, self.inner_grad_clip)
+                        layer_phi_next[key] = p_curr - eta_curr * g_detached
 
                 next_phi.append(layer_phi_next)
                 ttt_idx += 1
@@ -235,16 +261,26 @@ class Stage2FOMAMLTrainer:
         )
         outer_ce = q_out.loss
 
-        # Outer KL divergence regularization
+        # Outer anchor-preserving KL divergence and reference unadapted query loss
         outer_kl = torch.tensor(0.0, device=self.device)
         with torch.no_grad():
             self.model.reset_adapted_params()
-            q_ref_out = self.model(input_ids=q_input_ids, attention_mask=q_mask)
+            q_ref_out = self.model(input_ids=q_input_ids, attention_mask=q_mask, labels=q_labels)
+            ref_ce = q_ref_out.loss.detach() if q_ref_out.loss is not None else outer_ce.detach()
 
+        num_static = self.model.mole_layers[0].num_experts if self.model.mole_layers else None
         for g_k, g_ref in zip(q_out.router_gates_list, q_ref_out.router_gates_list):
-            outer_kl = outer_kl + compute_kl_trust_region_loss(g_k, g_ref)
+            outer_kl = outer_kl + compute_kl_trust_region_loss(
+                g_k, g_ref, num_static_experts=num_static
+            )
 
-        outer_loss = outer_ce + self.lambda_kl * (outer_kl / max(1, len(q_out.router_gates_list)))
+        # Contrastive memory margin: encourage adapted model to strictly beat unadapted reference
+        margin_loss = F.relu(outer_ce - ref_ce + 0.15)
+        outer_loss = (
+            outer_ce
+            + 0.25 * margin_loss
+            + self.lambda_kl * (outer_kl / max(1, len(q_out.router_gates_list)))
+        )
 
         # Backward on outer loss (accumulate)
         (outer_loss / self.meta_batch_size).backward()
@@ -254,6 +290,7 @@ class Stage2FOMAMLTrainer:
 
         return {
             "outer_ce": outer_ce.item(),
+            "ref_ce": ref_ce.item(),
             "outer_kl": outer_kl.item(),
             "outer_loss": outer_loss.item(),
         }
@@ -265,6 +302,7 @@ class Stage2FOMAMLTrainer:
 
         start_time = time.time()
         running_ce = 0.0
+        running_ref_ce = 0.0
         running_kl = 0.0
         running_loss = 0.0
 
@@ -278,6 +316,7 @@ class Stage2FOMAMLTrainer:
             metrics = self.train_episode(episode)
 
             running_ce += metrics["outer_ce"]
+            running_ref_ce += metrics.get("ref_ce", metrics["outer_ce"])
             running_kl += metrics["outer_kl"]
             running_loss += metrics["outer_loss"]
 
@@ -289,19 +328,22 @@ class Stage2FOMAMLTrainer:
 
             if ep_idx % self.logging_episodes == 0 or ep_idx == num_episodes:
                 avg_ce = running_ce / self.logging_episodes
+                avg_ref_ce = running_ref_ce / self.logging_episodes
                 avg_kl = running_kl / self.logging_episodes
                 avg_loss = running_loss / self.logging_episodes
+                mem_gain = avg_ref_ce - avg_ce
                 elapsed = time.time() - start_time
 
                 print(
                     f"Episode [{ep_idx:4d}/{num_episodes:4d}] | "
-                    f"Outer CE: {avg_ce:.4f} | "
+                    f"Outer CE: {avg_ce:.4f} (Ref: {avg_ref_ce:.4f}, Gain: {mem_gain:+.4f}) | "
                     f"Outer KL: {avg_kl:.4f} | "
                     f"Total Outer: {avg_loss:.4f} | "
                     f"Elapsed: {elapsed:.1f}s"
                 )
 
                 running_ce = 0.0
+                running_ref_ce = 0.0
                 running_kl = 0.0
                 running_loss = 0.0
 
