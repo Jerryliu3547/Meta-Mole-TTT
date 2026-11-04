@@ -251,42 +251,62 @@ def format_compiled_support_batch(
     }
 
 
-def generate_procedural_memory_episodes(num_episodes: int = 400, seed: int = 42) -> List[Dict[str, str]]:
+def generate_procedural_memory_episodes(num_episodes: int = 800, seed: int = 42) -> List[Dict[str, str]]:
     """
     Generates diverse procedural multi-entity associative recall and arithmetic episodes
-    for Stage 2 meta-training (strictly disjoint from held-out benchmark entities/values).
+    across 6 task families for Stage 2 meta-training (strictly disjoint from held-out test entities).
     """
     rng = random.Random(seed)
     episodes: List[Dict[str, str]] = []
 
-    names_pool = ["Elena", "Marcus", "Victor", "Sophia", "Lucas", "Nora", "Felix", "Clara", "Oscar", "Maya"]
-    cities_pool = ["Vienna", "Madrid", "Toronto", "Seoul", "Zurich", "Lisbon", "Oslo", "Prague", "Dublin", "Warsaw"]
-    projects_pool = ["Orion", "Vanguard", "Titan", "Horizon", "Nova", "Eclipse", "Aegis", "Vertex", "Zenith", "Pulsar"]
-    roles_pool = ["captains", "sentinels", "wardens", "scouts", "paladins", "rangers", "lancers", "heralds"]
-    colors_pool = ["crimson", "silver", "golden", "violet", "emerald", "amber", "cobalt", "ivory"]
-    items_pool = [
-        ("Oranges", "orange"),
-        ("Mangoes", "mango"),
-        ("Bananas", "banana"),
-        ("Lemons", "lemon"),
-        ("Pears", "pear"),
-        ("Plums", "plum"),
-        ("Cherries", "cherry"),
-        ("Grapes", "grape"),
+    names_pool = [
+        "Elena", "Marcus", "Victor", "Sophia", "Lucas", "Nora", "Felix", "Clara",
+        "Oscar", "Maya", "Julian", "Hannah", "Adrian", "Eva", "Gabriel", "Zoe",
+        "Liam", "Chloe", "Noah", "Emma", "Oliver", "Ava", "Ethan", "Mia",
     ]
+    cities_pool = [
+        "Vienna", "Madrid", "Toronto", "Seoul", "Zurich", "Lisbon", "Oslo", "Prague",
+        "Dublin", "Warsaw", "Helsinki", "Athens", "Brussels", "Geneva", "Milan", "Munich",
+        "Montreal", "Boston", "Seattle", "Austin", "Kyoto", "Melbourne", "Auckland", "Cairo",
+    ]
+    projects_pool = [
+        "Orion", "Vanguard", "Titan", "Horizon", "Nova", "Eclipse", "Aegis", "Vertex",
+        "Zenith", "Pulsar", "Nebula", "Falcon", "Atlas", "Phoenix", "Kronos", "Helios",
+        "Triton", "Hyperion", "Vector", "Cygnus",
+    ]
+    roles_pool = [
+        "captains", "sentinels", "wardens", "scouts", "paladins", "rangers", "lancers", "heralds",
+        "marshals", "templar", "dragoons", "pikemen", "halberdiers", "cavaliers", "guardians", "envoys",
+    ]
+    colors_pool = [
+        "crimson", "silver", "golden", "violet", "emerald", "amber", "cobalt", "ivory",
+        "scarlet", "bronze", "indigo", "maroon", "turquoise", "obsidian", "jade", "copper",
+    ]
+    items_pool = [
+        ("Oranges", "orange"), ("Mangoes", "mango"), ("Bananas", "banana"), ("Lemons", "lemon"),
+        ("Pears", "pear"), ("Plums", "plum"), ("Cherries", "cherry"), ("Grapes", "grape"),
+        ("Apricots", "apricot"), ("Figs", "fig"), ("Kiwis", "kiwi"), ("Limes", "lime"),
+        ("Papayas", "papaya"), ("Guavas", "guava"), ("Coconuts", "coconut"), ("Nectarines", "nectarine"),
+    ]
+    flights_pool = ["BA410", "LH520", "AF630", "QF740", "SQ850", "CX960", "NH170", "KL280", "IB390", "LX450", "SK560", "AY670"]
+    times_pool = ["06:15", "07:45", "08:30", "10:20", "11:50", "13:10", "14:40", "16:05", "17:35", "19:00", "20:25", "22:15"]
+    meds_pool = ["Ibuprofen", "Amoxicillin", "Codeine", "Tetracycline", "Morphine", "Cephalexin", "Erythromycin", "Lidocaine", "Naproxen", "Vancomycin"]
+
+    buyers_pool = ["Leo", "Mia", "Sam", "Nina", "Alex", "Toby", "Ruby", "Max"]
 
     for idx in range(num_episodes):
-        kind = idx % 4
+        kind = idx % 6
         if kind == 0:
-            # Multi-item inventory arithmetic
+            # 1. Multi-item inventory arithmetic
             picked = rng.sample(items_pool, 4)
             prices = [rng.randint(2, 9) for _ in range(4)]
             clauses = [f"{it[0]} cost ${pr} each." for it, pr in zip(picked, prices)]
             premise = "Store inventory and prices: " + " ".join(clauses)
             qty = rng.choice([3, 5])
+            buyer = rng.choice(buyers_pool)
             total = qty * prices[0] + prices[1]
             question = (
-                f"Leo bought {qty} {picked[0][0].lower()} and 1 {picked[1][1]}. "
+                f"{buyer} bought {qty} {picked[0][0].lower()} and 1 {picked[1][1]}. "
                 f"How much did he spend in total? Calculate step by step and output the final total as #### <number>"
             )
             answer = (
@@ -296,7 +316,7 @@ def generate_procedural_memory_episodes(num_episodes: int = 400, seed: int = 42)
             episodes.append({"premise": premise, "question": question, "answer": answer, "task_name": f"proc_math_{idx}"})
 
         elif kind == 1:
-            # Employee location lookup
+            # 2. Employee location lookup
             p_names = rng.sample(names_pool, 4)
             p_cities = rng.sample(cities_pool, 4)
             clauses = [f"{n} is stationed in {c}." for n, c in zip(p_names, p_cities)]
@@ -307,7 +327,7 @@ def generate_procedural_memory_episodes(num_episodes: int = 400, seed: int = 42)
             episodes.append({"premise": premise, "question": question, "answer": answer, "task_name": f"proc_loc_{idx}"})
 
         elif kind == 2:
-            # Project code lookup
+            # 3. Project code lookup
             p_projs = rng.sample(projects_pool, 3)
             p_codes = [str(rng.randint(1100, 9899)) for _ in range(3)]
             clauses = [f"Project {pr} has code {cd}." for pr, cd in zip(p_projs, p_codes)]
@@ -317,8 +337,8 @@ def generate_procedural_memory_episodes(num_episodes: int = 400, seed: int = 42)
             answer = f"{p_codes[target_i]}"
             episodes.append({"premise": premise, "question": question, "answer": answer, "task_name": f"proc_code_{idx}"})
 
-        else:
-            # Guard rules lookup
+        elif kind == 3:
+            # 4. Guard rules lookup
             p_roles = rng.sample(roles_pool, 3)
             p_colors = rng.sample(colors_pool, 3)
             clauses = [f"All {rl} must wear {cl} armor." for rl, cl in zip(p_roles, p_colors)]
@@ -327,6 +347,29 @@ def generate_procedural_memory_episodes(num_episodes: int = 400, seed: int = 42)
             question = f"What color armor do {p_roles[target_i]} wear?"
             answer = f"{p_roles[target_i].capitalize()} wear {p_colors[target_i]} armor."
             episodes.append({"premise": premise, "question": question, "answer": answer, "task_name": f"proc_rule_{idx}"})
+
+        elif kind == 4:
+            # 5. Flight schedule lookup
+            p_flights = rng.sample(flights_pool, 3)
+            p_cities = rng.sample(cities_pool, 3)
+            p_times = rng.sample(times_pool, 3)
+            clauses = [f"Flight {fl} departs to {ct} at {tm}." for fl, ct, tm in zip(p_flights, p_cities, p_times)]
+            premise = "Flight schedule: " + " ".join(clauses)
+            target_i = rng.randint(0, 2)
+            question = f"What time does Flight {p_flights[target_i]} depart?"
+            answer = f"Flight {p_flights[target_i]} departs to {p_cities[target_i]} at {p_times[target_i]}."
+            episodes.append({"premise": premise, "question": question, "answer": answer, "task_name": f"proc_flight_{idx}"})
+
+        else:
+            # 6. Medical allergy lookup
+            p_names = rng.sample(names_pool, 3)
+            p_meds = rng.sample(meds_pool, 3)
+            clauses = [f"Patient {nm} has allergy to {md}." for nm, md in zip(p_names, p_meds)]
+            premise = "Medical records: " + " ".join(clauses)
+            target_i = rng.randint(0, 2)
+            question = f"What medication is Patient {p_names[target_i]} allergic to?"
+            answer = f"Patient {p_names[target_i]} is allergic to {p_meds[target_i]}."
+            episodes.append({"premise": premise, "question": question, "answer": answer, "task_name": f"proc_med_{idx}"})
 
     return episodes
 
@@ -438,6 +481,8 @@ def create_paradigm_a_episodic_loader(
         except Exception as e:
             print(f"[Paradigm A Data] Note: Using procedural + synthetic memory corpus ({e}).")
 
+    # Interleave/shuffle procedural associative recall and factual QA episodes
+    random.Random(101).shuffle(samples)
     dataset = ParadigmADataset(samples=samples, tokenizer=tokenizer, max_length=max_length)
     episodes = [dataset[i % len(dataset)] for i in range(num_episodes)]
     return episodes

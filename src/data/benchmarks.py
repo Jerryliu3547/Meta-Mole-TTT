@@ -142,6 +142,18 @@ PARADIGM_A_SAMPLE_ITEMS: List[BenchmarkItem] = [
         query_input="What color armor do squires wear?",
         ground_truth="blue",
     ),
+    BenchmarkItem(
+        task_name="paradigm_a_flight_schedule",
+        context_premise="Flight schedule: Flight AA100 departs to Chicago at 08:00. Flight DL200 departs to Atlanta at 09:30. Flight UA300 departs to Denver at 11:15.",
+        query_input="What time does Flight DL200 depart?",
+        ground_truth="09:30",
+    ),
+    BenchmarkItem(
+        task_name="paradigm_a_medical_allergy",
+        context_premise="Medical records: Patient John has allergy to Penicillin. Patient Sarah has allergy to Aspirin. Patient Mike has allergy to Sulfa.",
+        query_input="What medication is Patient Sarah allergic to?",
+        ground_truth="Aspirin",
+    ),
 ]
 
 

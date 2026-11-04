@@ -88,6 +88,12 @@ class Stage2FOMAMLTrainer:
                 {"params": eta_meta_params, "lr": meta_lr_eta},
             ]
         )
+        total_opt_steps = max(1, self.total_episodes // max(1, self.meta_batch_size))
+        self.outer_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.outer_optimizer,
+            T_max=total_opt_steps,
+            eta_min=meta_lr_gate * 0.1,
+        )
 
     def _execute_inner_loop(
         self,
@@ -120,28 +126,8 @@ class Stage2FOMAMLTrainer:
                 "B_dyn": torch.zeros_like(layer.B_dyn).requires_grad_(True),  # B_dyn^(0) = 0
             })
 
-        # Run k inner steps
+        # Run k inner steps (First-Order MAML with Frobenius-normalized gradients, FlashAttention compatible)
         for step_t in range(self.inner_steps):
-            is_last_step = (step_t == self.inner_steps - 1)
-
-            # On the final step, re-attach meta-parameters via straight-through bridge
-            # so create_graph=True differentiates write gradients w.r.t. A_dyn and router
-            if is_last_step and step_t > 0:
-                bridged_phi: List[Dict[str, torch.Tensor]] = []
-                ttt_i = 0
-                for layer in self.model.mole_layers:
-                    if not layer.is_ttt_layer:
-                        continue
-                    c_phi = current_phi[ttt_i]
-                    bridged_phi.append({
-                        "router_weight": layer.router_weight + (c_phi["router_weight"] - layer.router_weight).detach(),
-                        "router_bias": layer.router_bias + (c_phi["router_bias"] - layer.router_bias).detach(),
-                        "A_dyn": layer.A_dyn + (c_phi["A_dyn"] - layer.A_dyn).detach(),
-                        "B_dyn": c_phi["B_dyn"].detach().requires_grad_(True),
-                    })
-                    ttt_i += 1
-                current_phi = bridged_phi
-
             # Apply current phi to model
             self.model.set_adapted_params(current_phi)
 
@@ -197,12 +183,11 @@ class Stage2FOMAMLTrainer:
             num_ttt = max(1, ttt_idx)
             inner_loss = s_ce_loss + (self.gamma_kl * total_inner_kl / num_ttt) + (self.gamma_ortho * total_inner_ortho / num_ttt)
 
-            # Compute gradients of inner loss w.r.t active parameters
-            # Retain graph on the final inner step so B_dyn^(k) carries write-phase gradients to A_dyn & router
+            # First-order MAML (create_graph=False) for FlashAttention compatibility
             inner_grads = torch.autograd.grad(
                 inner_loss,
                 active_tensors,
-                create_graph=is_last_step,
+                create_graph=False,
                 allow_unused=True,
             )
 
@@ -226,14 +211,8 @@ class Stage2FOMAMLTrainer:
 
                     # Frobenius norm normalization for scale-invariant associative updates
                     g_norm = torch.norm(g_curr.detach(), p="fro") + 1e-6
-
-                    if is_last_step and key == "B_dyn":
-                        # Keep write-phase graph connected for B_dyn -> A_dyn & router_weight
-                        g_normalized = g_curr / g_norm
-                        layer_phi_next[key] = p_curr.detach() - eta_curr * g_normalized
-                    else:
-                        g_detached = torch.clamp(g_curr.detach() / g_norm, -self.inner_grad_clip, self.inner_grad_clip)
-                        layer_phi_next[key] = p_curr - eta_curr * g_detached
+                    g_detached = torch.clamp(g_curr.detach() / g_norm, -self.inner_grad_clip, self.inner_grad_clip)
+                    layer_phi_next[key] = p_curr - eta_curr * g_detached
 
                 next_phi.append(layer_phi_next)
                 ttt_idx += 1
@@ -324,6 +303,7 @@ class Stage2FOMAMLTrainer:
             if ep_idx % self.meta_batch_size == 0 or ep_idx == num_episodes:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.outer_grad_clip)
                 self.outer_optimizer.step()
+                self.outer_scheduler.step()
                 self.outer_optimizer.zero_grad()
 
             if ep_idx % self.logging_episodes == 0 or ep_idx == num_episodes:

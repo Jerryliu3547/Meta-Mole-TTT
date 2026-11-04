@@ -44,14 +44,14 @@ stage2:
   gamma_ortho: 0.05
   lambda_kl: 0.05
   meta_batch_size: 2
-  total_episodes: 300
+  total_episodes: 500
   max_length: 512
-  logging_episodes: 20
+  logging_episodes: 25
   save_episodes: 100
   output_dir: "checkpoints/paradigm_a/stage2"
 
 inference:
-  inner_steps: 10
+  inner_steps: 12
   max_new_tokens: 64
   temperature: 0.7
   top_p: 0.9

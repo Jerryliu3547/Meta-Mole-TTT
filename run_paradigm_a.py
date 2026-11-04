@@ -149,10 +149,19 @@ def run_stage2(cfg: Dict[str, Any], device: torch.device):
 
     mole_model.expand_for_stage2_surgery(
         freeze_static_experts=cfg["surgery"].get("freeze_static_experts", True),
-        scratchpad_bias_init=float(cfg["surgery"].get("scratchpad_bias_init", -2.0)),
+        scratchpad_bias_init=float(cfg["surgery"].get("scratchpad_bias_init", 0.8)),
     )
 
-    if os.path.exists(os.path.join(surg_ckpt, "meta_mole_weights.pt")):
+    s2_out_dir = s2_cfg.get("output_dir", "checkpoints/paradigm_a/stage2")
+    if os.path.exists(os.path.join(s2_out_dir, "meta_mole_weights.pt")):
+        print(f"[Paradigm A] Resuming continuous meta-training from existing Stage 2 checkpoint: {s2_out_dir}...")
+        mole_model.load_mole_weights(s2_out_dir, strict=False)
+        # Ensure step sizes are at least in the fast-weight memory regime if resuming from an older run
+        with torch.no_grad():
+            for l in mole_model.mole_layers:
+                if l.is_ttt_layer and l.raw_eta_B_dyn.item() < -2.5:
+                    l.raw_eta_B_dyn.fill_(-1.8)
+    elif os.path.exists(os.path.join(surg_ckpt, "meta_mole_weights.pt")):
         print(f"[Paradigm A] Loading surgery checkpoint from {surg_ckpt}...")
         mole_model.load_mole_weights(surg_ckpt, strict=False)
 
@@ -298,12 +307,15 @@ def main():
         help="Stage to execute",
     )
     parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu)")
+    parser.add_argument("--episodes", type=int, default=None, help="Override total_episodes for Stage 2")
     args = parser.parse_args()
 
     device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
     print(f"[Paradigm A] Using device: {device}")
 
     cfg = load_config(args.config)
+    if args.episodes is not None:
+        cfg["stage2"]["total_episodes"] = args.episodes
 
     if args.stage == "1":
         run_stage1(cfg, device)
@@ -314,7 +326,12 @@ def main():
     elif args.stage == "eval":
         run_eval(cfg, device)
     elif args.stage == "full":
-        run_surgery(cfg, device)
+        s2_out = cfg["stage2"].get("output_dir", "checkpoints/paradigm_a/stage2")
+        surg_out = cfg["surgery"].get("output_dir", "checkpoints/paradigm_a/stage2_init")
+        if not os.path.exists(os.path.join(s2_out, "meta_mole_weights.pt")) and not os.path.exists(
+            os.path.join(surg_out, "meta_mole_weights.pt")
+        ):
+            run_surgery(cfg, device)
         run_stage2(cfg, device)
         run_eval(cfg, device)
 

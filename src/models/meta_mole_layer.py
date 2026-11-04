@@ -52,7 +52,7 @@ class MetaMoLELinear(nn.Module):
         self.num_experts = num_experts
         self.rank = rank
         self.scaling = alpha / rank
-        self.dyn_scaling = 1.0
+        self.dyn_scaling = math.sqrt(self.out_features / 896.0) * 1.2
         self.router_temp = router_temp
         self.is_ttt_layer = is_ttt_layer
         self.stage = 1  # 1 = Pure Collaborative MoLE, 2 = Frozen Anchors + Meta-TTT Scratchpad
