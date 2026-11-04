@@ -4,6 +4,8 @@ Implements the First-Order MAML inner loop with detached gradients and
 Meta-SGD step size learning without second-order Hessian overhead.
 """
 
+from contextlib import nullcontext
+import math
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -19,6 +21,23 @@ from ..models.regularizers import (
     compute_dynamic_orthogonality_loss,
     compute_kl_trust_region_loss,
 )
+
+
+def _math_sdpa_context():
+    """
+    Solution 2: Forces PyTorch's MATH SDPA backend so second-order backward (`create_graph=True`)
+    through the final inner-loop write step succeeds without triggering FlashAttention's
+    unimplemented double-backward kernel.
+    """
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        return sdpa_kernel(SDPBackend.MATH)
+    except Exception:
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+            return torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_math=True, enable_mem_efficient=False
+            )
+        return nullcontext()
 
 
 class Stage2FOMAMLTrainer:
@@ -114,8 +133,9 @@ class Stage2FOMAMLTrainer:
             ref_output = self.model(input_ids=s_input_ids, attention_mask=s_mask)
             ref_gates_list = [g.detach() for g in ref_output.router_gates_list]
 
-        # Initialize current state phi^(0)
+        # Initialize current state phi^(0) and Solution 3 inner-loop momentum buffers
         current_phi: List[Dict[str, torch.Tensor]] = []
+        velocity_phi: List[Dict[str, torch.Tensor]] = []
         for layer in self.model.mole_layers:
             if not layer.is_ttt_layer:
                 continue
@@ -125,71 +145,106 @@ class Stage2FOMAMLTrainer:
                 "A_dyn": layer.A_dyn,
                 "B_dyn": torch.zeros_like(layer.B_dyn).requires_grad_(True),  # B_dyn^(0) = 0
             })
+            velocity_phi.append({
+                "router_weight": torch.zeros_like(layer.router_weight),
+                "router_bias": torch.zeros_like(layer.router_bias),
+                "A_dyn": torch.zeros_like(layer.A_dyn),
+                "B_dyn": torch.zeros_like(layer.B_dyn),
+            })
 
-        # Run k inner steps (First-Order MAML with Frobenius-normalized gradients, FlashAttention compatible)
+        momentum_beta = 0.5
+
+        # Run k inner steps with Solution 2 (SDPBackend.MATH for create_graph=True on final step)
+        # and Solution 3 (Inner-Loop Momentum + Cosine Step Decay)
         for step_t in range(self.inner_steps):
+            is_last_step = (step_t == self.inner_steps - 1)
+            if self.inner_steps > 1:
+                cos_decay = 0.35 + 0.65 * 0.5 * (1.0 + math.cos(math.pi * step_t / (self.inner_steps - 1)))
+            else:
+                cos_decay = 1.0
+
+            # On the final step, re-attach meta-parameters via straight-through bridge
+            if is_last_step and step_t > 0:
+                bridged_phi: List[Dict[str, torch.Tensor]] = []
+                ttt_i = 0
+                for layer in self.model.mole_layers:
+                    if not layer.is_ttt_layer:
+                        continue
+                    c_phi = current_phi[ttt_i]
+                    bridged_phi.append({
+                        "router_weight": layer.router_weight + (c_phi["router_weight"] - layer.router_weight).detach(),
+                        "router_bias": layer.router_bias + (c_phi["router_bias"] - layer.router_bias).detach(),
+                        "A_dyn": layer.A_dyn + (c_phi["A_dyn"] - layer.A_dyn).detach(),
+                        "B_dyn": c_phi["B_dyn"].detach().requires_grad_(True),
+                    })
+                    ttt_i += 1
+                current_phi = bridged_phi
+
             # Apply current phi to model
             self.model.set_adapted_params(current_phi)
 
-            # Forward pass on support context
-            s_out = self.model(
-                input_ids=s_input_ids,
-                attention_mask=s_mask,
-                labels=s_labels,
-            )
-            s_ce_loss = s_out.loss
+            # Solution 2: Use MATH SDPA kernel on the final step so create_graph=True is supported
+            sdpa_ctx = _math_sdpa_context() if is_last_step else nullcontext()
+            with sdpa_ctx:
+                # Forward pass on support context
+                s_out = self.model(
+                    input_ids=s_input_ids,
+                    attention_mask=s_mask,
+                    labels=s_labels,
+                )
+                s_ce_loss = s_out.loss
 
-            # Compute regularizers: Anchor-preserving KL divergence and Dynamic Subspace Orthogonality
-            total_inner_kl = torch.tensor(0.0, device=self.device)
-            total_inner_ortho = torch.tensor(0.0, device=self.device)
+                # Compute regularizers: Anchor-preserving KL divergence and Dynamic Subspace Orthogonality
+                total_inner_kl = torch.tensor(0.0, device=self.device)
+                total_inner_ortho = torch.tensor(0.0, device=self.device)
 
-            ttt_idx = 0
-            active_tensors: List[torch.Tensor] = []
-            active_etas: List[torch.Tensor] = []
+                ttt_idx = 0
+                active_tensors: List[torch.Tensor] = []
+                active_etas: List[torch.Tensor] = []
 
-            for l_idx, layer in enumerate(self.model.mole_layers):
-                if not layer.is_ttt_layer:
-                    continue
+                for l_idx, layer in enumerate(self.model.mole_layers):
+                    if not layer.is_ttt_layer:
+                        continue
 
-                curr_layer_phi = current_phi[ttt_idx]
-                r_w = curr_layer_phi["router_weight"]
-                r_b = curr_layer_phi["router_bias"]
-                a_d = curr_layer_phi["A_dyn"]
-                b_d = curr_layer_phi["B_dyn"]
+                    curr_layer_phi = current_phi[ttt_idx]
+                    r_w = curr_layer_phi["router_weight"]
+                    r_b = curr_layer_phi["router_bias"]
+                    a_d = curr_layer_phi["A_dyn"]
+                    b_d = curr_layer_phi["B_dyn"]
 
-                active_tensors.extend([r_w, r_b, a_d, b_d])
-                active_etas.extend([
-                    F.softplus(layer.raw_eta_gate),
-                    F.softplus(layer.raw_eta_gate),
-                    F.softplus(layer.raw_eta_A_dyn),
-                    F.softplus(layer.raw_eta_B_dyn),
-                ])
+                    active_tensors.extend([r_w, r_b, a_d, b_d])
+                    active_etas.extend([
+                        F.softplus(layer.raw_eta_gate) * cos_decay,
+                        F.softplus(layer.raw_eta_gate) * cos_decay,
+                        F.softplus(layer.raw_eta_A_dyn) * cos_decay,
+                        F.softplus(layer.raw_eta_B_dyn) * cos_decay,
+                    ])
 
-                # Anchor-Preserving KL Trust Region over the N static experts
-                if l_idx < len(s_out.router_gates_list) and l_idx < len(ref_gates_list):
-                    total_inner_kl = total_inner_kl + compute_kl_trust_region_loss(
-                        s_out.router_gates_list[l_idx],
-                        ref_gates_list[l_idx],
-                        num_static_experts=layer.num_experts,
+                    # Anchor-Preserving KL Trust Region over the N static experts
+                    if l_idx < len(s_out.router_gates_list) and l_idx < len(ref_gates_list):
+                        total_inner_kl = total_inner_kl + compute_kl_trust_region_loss(
+                            s_out.router_gates_list[l_idx],
+                            ref_gates_list[l_idx],
+                            num_static_experts=layer.num_experts,
+                        )
+
+                    # Dynamic Orthogonality constraint
+                    total_inner_ortho = total_inner_ortho + compute_dynamic_orthogonality_loss(
+                        a_d, layer.A_static
                     )
 
-                # Dynamic Orthogonality constraint
-                total_inner_ortho = total_inner_ortho + compute_dynamic_orthogonality_loss(
-                    a_d, layer.A_static
+                    ttt_idx += 1
+
+                num_ttt = max(1, ttt_idx)
+                inner_loss = s_ce_loss + (self.gamma_kl * total_inner_kl / num_ttt) + (self.gamma_ortho * total_inner_ortho / num_ttt)
+
+                # Retain graph on the final inner step under MATH SDPA so B_dyn^(k) carries write gradients
+                inner_grads = torch.autograd.grad(
+                    inner_loss,
+                    active_tensors,
+                    create_graph=is_last_step,
+                    allow_unused=True,
                 )
-
-                ttt_idx += 1
-
-            num_ttt = max(1, ttt_idx)
-            inner_loss = s_ce_loss + (self.gamma_kl * total_inner_kl / num_ttt) + (self.gamma_ortho * total_inner_ortho / num_ttt)
-
-            # First-order MAML (create_graph=False) for FlashAttention compatibility
-            inner_grads = torch.autograd.grad(
-                inner_loss,
-                active_tensors,
-                create_graph=False,
-                allow_unused=True,
-            )
 
             next_phi: List[Dict[str, torch.Tensor]] = []
             tensor_ptr = 0
@@ -209,10 +264,22 @@ class Stage2FOMAMLTrainer:
                     if g_curr is None:
                         g_curr = torch.zeros_like(p_curr)
 
-                    # Frobenius norm normalization for scale-invariant associative updates
                     g_norm = torch.norm(g_curr.detach(), p="fro") + 1e-6
-                    g_detached = torch.clamp(g_curr.detach() / g_norm, -self.inner_grad_clip, self.inner_grad_clip)
-                    layer_phi_next[key] = p_curr - eta_curr * g_detached
+                    v_prev = velocity_phi[ttt_idx][key]
+
+                    if is_last_step and key == "B_dyn":
+                        # Solution 2 + 3: Differentiable write update with momentum
+                        v_live = momentum_beta * v_prev + (1.0 - momentum_beta) * (g_curr / g_norm)
+                        v_live_norm = torch.norm(v_live.detach(), p="fro") + 1e-6
+                        layer_phi_next[key] = p_curr.detach() - eta_curr * (v_live / v_live_norm)
+                        velocity_phi[ttt_idx][key] = v_live.detach()
+                    else:
+                        g_unit = g_curr.detach() / g_norm
+                        v_next = momentum_beta * v_prev + (1.0 - momentum_beta) * g_unit
+                        v_next_norm = torch.norm(v_next, p="fro") + 1e-6
+                        v_normalized = torch.clamp(v_next / v_next_norm, -self.inner_grad_clip, self.inner_grad_clip)
+                        velocity_phi[ttt_idx][key] = v_next.detach()
+                        layer_phi_next[key] = p_curr - eta_curr * v_normalized
 
                 next_phi.append(layer_phi_next)
                 ttt_idx += 1
@@ -226,43 +293,44 @@ class Stage2FOMAMLTrainer:
         # 1. Inner loop adaptation
         phi_k = self._execute_inner_loop(episode.support_batch)
 
-        # 2. Outer loop evaluation on Query set
+        # 2. Outer loop evaluation on Query set (inside MATH SDPA context for second-order backward)
         self.model.set_adapted_params(phi_k)
 
         q_input_ids = episode.query_batch["input_ids"].to(self.device)
         q_mask = episode.query_batch["attention_mask"].to(self.device)
         q_labels = episode.query_batch["labels"].to(self.device)
 
-        q_out = self.model(
-            input_ids=q_input_ids,
-            attention_mask=q_mask,
-            labels=q_labels,
-        )
-        outer_ce = q_out.loss
+        with _math_sdpa_context():
+            q_out = self.model(
+                input_ids=q_input_ids,
+                attention_mask=q_mask,
+                labels=q_labels,
+            )
+            outer_ce = q_out.loss
 
-        # Outer anchor-preserving KL divergence and reference unadapted query loss
-        outer_kl = torch.tensor(0.0, device=self.device)
-        with torch.no_grad():
-            self.model.reset_adapted_params()
-            q_ref_out = self.model(input_ids=q_input_ids, attention_mask=q_mask, labels=q_labels)
-            ref_ce = q_ref_out.loss.detach() if q_ref_out.loss is not None else outer_ce.detach()
+            # Outer anchor-preserving KL divergence and reference unadapted query loss
+            outer_kl = torch.tensor(0.0, device=self.device)
+            with torch.no_grad():
+                self.model.reset_adapted_params()
+                q_ref_out = self.model(input_ids=q_input_ids, attention_mask=q_mask, labels=q_labels)
+                ref_ce = q_ref_out.loss.detach() if q_ref_out.loss is not None else outer_ce.detach()
 
-        num_static = self.model.mole_layers[0].num_experts if self.model.mole_layers else None
-        for g_k, g_ref in zip(q_out.router_gates_list, q_ref_out.router_gates_list):
-            outer_kl = outer_kl + compute_kl_trust_region_loss(
-                g_k, g_ref, num_static_experts=num_static
+            num_static = self.model.mole_layers[0].num_experts if self.model.mole_layers else None
+            for g_k, g_ref in zip(q_out.router_gates_list, q_ref_out.router_gates_list):
+                outer_kl = outer_kl + compute_kl_trust_region_loss(
+                    g_k, g_ref, num_static_experts=num_static
+                )
+
+            # Contrastive memory margin: encourage adapted model to strictly beat unadapted reference
+            margin_loss = F.relu(outer_ce - ref_ce + 0.15)
+            outer_loss = (
+                outer_ce
+                + 0.25 * margin_loss
+                + self.lambda_kl * (outer_kl / max(1, len(q_out.router_gates_list)))
             )
 
-        # Contrastive memory margin: encourage adapted model to strictly beat unadapted reference
-        margin_loss = F.relu(outer_ce - ref_ce + 0.15)
-        outer_loss = (
-            outer_ce
-            + 0.25 * margin_loss
-            + self.lambda_kl * (outer_kl / max(1, len(q_out.router_gates_list)))
-        )
-
-        # Backward on outer loss (accumulate)
-        (outer_loss / self.meta_batch_size).backward()
+            # Backward on outer loss (accumulate)
+            (outer_loss / self.meta_batch_size).backward()
 
         # Reset model parameter temporary state
         self.model.reset_adapted_params()

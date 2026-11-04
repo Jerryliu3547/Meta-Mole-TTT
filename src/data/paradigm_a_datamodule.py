@@ -207,48 +207,63 @@ def format_compiled_support_batch(
     tokenizer: PreTrainedTokenizer,
     max_length: int = 512,
     device: Optional[torch.device] = None,
+    max_batch_rows: int = 8,
 ) -> Dict[str, torch.Tensor]:
     """
-    Tokenizes compiled self-supervised recall pairs from `premise` into a single support sequence
-    with user prompts masked (-100) and assistant recall answers active.
+    Solution 1: Tokenizes compiled self-supervised recall pairs from `premise` into a BATCH
+    of independent, isolated sequences `[N_pairs, max_row_len]` rather than a single concatenated
+    sequence. This prevents causal self-attention from "cheating" across turns and forces
+    the inner loop to write Q->A associations directly into fast weights `B_dyn`.
     """
     pairs = compile_premise_to_support_pairs(premise)
-    input_ids_list: List[int] = []
-    labels_list: List[int] = []
+    # Prioritize specific clause-level Q->A recall drills over generic full-premise dump
+    if len(pairs) > 1:
+        ordered_pairs = pairs[1:] + [pairs[0]]
+    else:
+        ordered_pairs = pairs
 
-    for pair in pairs:
+    row_items: List[Dict[str, torch.Tensor]] = []
+    for pair in ordered_pairs[:max_batch_rows]:
         u_txt = f"<|im_start|>user\n{pair['q']}<|im_end|>\n<|im_start|>assistant\n"
         a_txt = f"{pair['a']}<|im_end|>\n"
         u_ids = tokenizer.encode(u_txt, add_special_tokens=False)
         a_ids = tokenizer.encode(a_txt, add_special_tokens=False)
 
-        if len(input_ids_list) + len(u_ids) + len(a_ids) > max_length:
-            break
-        input_ids_list.extend(u_ids + a_ids)
-        labels_list.extend([-100] * len(u_ids) + a_ids)
+        full_ids = (u_ids + a_ids)[:max_length]
+        if len(full_ids) <= len(u_ids):
+            continue
 
-    if not input_ids_list:
-        # Fallback if single premise exceeded max_length
+        row_input_ids = torch.tensor(full_ids, dtype=torch.long)
+        row_mask = torch.ones_like(row_input_ids)
+        row_labels = torch.tensor(
+            ([-100] * len(u_ids) + a_ids)[: len(full_ids)],
+            dtype=torch.long,
+        )
+        row_items.append({
+            "input_ids": row_input_ids,
+            "attention_mask": row_mask,
+            "labels": row_labels,
+        })
+
+    if not row_items:
         u_txt = "<|im_start|>user\nState the stored context facts.<|im_end|>\n<|im_start|>assistant\n"
         a_txt = f"{premise}<|im_end|>\n"
         u_ids = tokenizer.encode(u_txt, add_special_tokens=False)
         a_ids = tokenizer.encode(a_txt, add_special_tokens=False)[: max(1, max_length - len(u_ids))]
-        input_ids_list = u_ids + a_ids
-        labels_list = [-100] * len(u_ids) + a_ids
+        row_input_ids = torch.tensor(u_ids + a_ids, dtype=torch.long)
+        row_items.append({
+            "input_ids": row_input_ids,
+            "attention_mask": torch.ones_like(row_input_ids),
+            "labels": torch.tensor([-100] * len(u_ids) + a_ids, dtype=torch.long),
+        })
 
-    t_kwargs = {"dtype": torch.long}
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    collated = pad_collate_fn(row_items, pad_token_id=pad_id)
+
     if device is not None:
-        t_kwargs["device"] = device
+        collated = {k: v.to(device) for k, v in collated.items()}
 
-    s_input_ids = torch.tensor([input_ids_list], **t_kwargs)
-    s_labels = torch.tensor([labels_list], **t_kwargs)
-    s_mask = torch.ones_like(s_input_ids)
-
-    return {
-        "input_ids": s_input_ids,
-        "attention_mask": s_mask,
-        "labels": s_labels,
-    }
+    return collated
 
 
 def generate_procedural_memory_episodes(num_episodes: int = 800, seed: int = 42) -> List[Dict[str, str]]:

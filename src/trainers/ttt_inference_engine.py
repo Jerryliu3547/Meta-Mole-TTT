@@ -5,6 +5,7 @@ invalidates and refreshes the KV cache, generates responses autoregressively,
 and strictly resets the model to guarantee test-time statelessness.
 """
 
+import math
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -118,8 +119,9 @@ class TTTInferenceEngine:
             ref_out = self.model(input_ids=input_ids, attention_mask=attention_mask)
             ref_gates = [g.detach() for g in ref_out.router_gates_list]
 
-        # Initialize adaptable parameters
+        # Initialize adaptable parameters and Solution 3 momentum buffers
         current_phi: List[Dict[str, torch.Tensor]] = []
+        velocity_phi: List[Dict[str, torch.Tensor]] = []
         for layer in self.model.mole_layers:
             if not layer.is_ttt_layer:
                 continue
@@ -129,9 +131,22 @@ class TTTInferenceEngine:
                 "A_dyn": layer.A_dyn.clone().detach().requires_grad_(True),
                 "B_dyn": torch.zeros_like(layer.B_dyn).requires_grad_(True),
             })
+            velocity_phi.append({
+                "router_weight": torch.zeros_like(layer.router_weight),
+                "router_bias": torch.zeros_like(layer.router_bias),
+                "A_dyn": torch.zeros_like(layer.A_dyn),
+                "B_dyn": torch.zeros_like(layer.B_dyn),
+            })
+
+        momentum_beta = 0.5
 
         for step_t in range(self.inner_steps):
             self.model.set_adapted_params(current_phi)
+
+            if self.inner_steps > 1:
+                cos_decay = 0.35 + 0.65 * 0.5 * (1.0 + math.cos(math.pi * step_t / (self.inner_steps - 1)))
+            else:
+                cos_decay = 1.0
 
             output = self.model(
                 input_ids=input_ids,
@@ -139,6 +154,10 @@ class TTTInferenceEngine:
                 labels=labels,
             )
             loss_ce = output.loss
+
+            # Solution 3: Soft brake when support batch CE loss is already saturated (< 0.08)
+            if loss_ce is not None and loss_ce.item() < 0.08:
+                cos_decay *= 0.25
 
             total_kl = torch.tensor(0.0, device=self.device)
             total_ortho = torch.tensor(0.0, device=self.device)
@@ -158,22 +177,22 @@ class TTTInferenceEngine:
 
                 active_tensors.extend([r_w, r_b, a_d, b_d])
                 if self.ad_hoc_eta is not None:
-                    eta_val = torch.tensor(self.ad_hoc_eta, device=self.device)
+                    eta_val = torch.tensor(self.ad_hoc_eta * cos_decay, device=self.device)
                     active_etas.extend([eta_val, eta_val, eta_val, eta_val])
                 elif "is_memory" in support_tensors:
-                    # Use meta-learned step sizes with a floor for high-fidelity fast-weight storage
+                    # Use meta-learned step sizes with cosine decay for high-fidelity fast-weight storage
                     active_etas.extend([
-                        torch.clamp(F.softplus(layer.raw_eta_gate).detach(), min=0.05),
-                        torch.clamp(F.softplus(layer.raw_eta_gate).detach(), min=0.05),
-                        torch.clamp(F.softplus(layer.raw_eta_A_dyn).detach(), min=0.05),
-                        torch.clamp(F.softplus(layer.raw_eta_B_dyn).detach(), min=0.18),
+                        torch.clamp(F.softplus(layer.raw_eta_gate).detach(), min=0.05) * cos_decay,
+                        torch.clamp(F.softplus(layer.raw_eta_gate).detach(), min=0.05) * cos_decay,
+                        torch.clamp(F.softplus(layer.raw_eta_A_dyn).detach(), min=0.05) * cos_decay,
+                        torch.clamp(F.softplus(layer.raw_eta_B_dyn).detach(), min=0.18) * cos_decay,
                     ])
                 else:
                     active_etas.extend([
-                        F.softplus(layer.raw_eta_gate).detach(),
-                        F.softplus(layer.raw_eta_gate).detach(),
-                        F.softplus(layer.raw_eta_A_dyn).detach(),
-                        F.softplus(layer.raw_eta_B_dyn).detach(),
+                        F.softplus(layer.raw_eta_gate).detach() * cos_decay,
+                        F.softplus(layer.raw_eta_gate).detach() * cos_decay,
+                        F.softplus(layer.raw_eta_A_dyn).detach() * cos_decay,
+                        F.softplus(layer.raw_eta_B_dyn).detach() * cos_decay,
                     ])
 
                 if l_idx < len(output.router_gates_list) and l_idx < len(ref_gates):
@@ -197,6 +216,7 @@ class TTTInferenceEngine:
 
             next_phi: List[Dict[str, torch.Tensor]] = []
             ptr = 0
+            ttt_i = 0
             for layer in self.model.mole_layers:
                 if not layer.is_ttt_layer:
                     continue
@@ -211,12 +231,19 @@ class TTTInferenceEngine:
                         g = torch.zeros_like(p_curr)
 
                     g_norm = torch.norm(g.detach(), p="fro") + 1e-6
-                    g_clipped = torch.clamp(g.detach() / g_norm, -self.grad_clip, self.grad_clip)
-                    # Test-time update
-                    p_next = (p_curr.detach() - eta * g_clipped).detach().requires_grad_(True)
+                    g_unit = g.detach() / g_norm
+                    v_prev = velocity_phi[ttt_i][key]
+                    v_next = momentum_beta * v_prev + (1.0 - momentum_beta) * g_unit
+                    v_next_norm = torch.norm(v_next, p="fro") + 1e-6
+                    v_clipped = torch.clamp(v_next / v_next_norm, -self.grad_clip, self.grad_clip)
+                    velocity_phi[ttt_i][key] = v_next.detach()
+
+                    # Test-time update with momentum + cosine decay
+                    p_next = (p_curr.detach() - eta * v_clipped).detach().requires_grad_(True)
                     next_layer_phi[key] = p_next
 
                 next_phi.append(next_layer_phi)
+                ttt_i += 1
 
             current_phi = next_phi
 
